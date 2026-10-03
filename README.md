@@ -7,6 +7,8 @@ A lightweight message board designed for the **AREDN (Amateur Radio Emergency Da
 
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/DSC_3225.JPG" alt="ESP32" width="500">
 
+<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/web-flasher.png" alt="web flasher" width="500">
+
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/msg-board-www.jpg" alt="ESP32" width="500">
 
 
