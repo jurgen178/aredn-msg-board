@@ -158,7 +158,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       font-weight: 700;
     }
 
-    input, textarea {
+    input, textarea, select {
       display: block;
       width: 100%;
       border: 1px solid #aebdb3;
@@ -178,7 +178,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       line-height: 1.5;
     }
 
-    input:focus, textarea:focus, button:focus-visible {
+    input:focus, textarea:focus, select:focus, button:focus-visible {
       outline: 3px solid #d9945e;
       outline-offset: 2px;
       border-color: var(--orange);
@@ -263,7 +263,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
     .feed-title { display: flex; align-items: center; gap: 12px; }
     .board-actions { display: flex; gap: 8px; margin-left: auto; }
 
-    .refresh-button {
+    .board-action-button {
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -275,9 +275,9 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       text-decoration: none;
     }
 
-    .refresh-button[hidden] { display: none; }
+    .board-action-button[hidden] { display: none; }
 
-    .refresh-button:hover:not(:disabled) { background: #d3e3d8; }
+    .board-action-button:hover:not(:disabled) { background: #d3e3d8; }
 
     .feed-info {
       min-height: 24px;
@@ -288,12 +288,13 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
 
     .message-search {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
       gap: 8px;
       margin: 0 0 14px;
     }
 
     .message-search input { min-width: 0; }
+    .message-search select { min-width: 130px; }
     .message-search button { min-height: 42px; padding: 0 13px; font-size: 0.86rem; }
 
     .message-list {
@@ -310,6 +311,10 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       overflow-wrap: anywhere;
     }
 
+    .message.priority-green { border-left-color: #759985; }
+    .message.priority-orange { border-left-color: #e68a00; }
+    .message.priority-red { border-left-color: #c62828; }
+
     .message-meta {
       padding: 6px 8px;
       border-radius: 4px;
@@ -321,7 +326,21 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       margin-bottom: 8px;
     }
 
+    .message.priority-orange .message-meta { background: #fff0cf; }
+    .message.priority-red .message-meta { background: #ffe5e5; }
+
     .message-name { font-weight: 700; }
+    .message-priority {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .message-priority-green { color: #216e39; background: #dff3e4; }
+    .message-priority-orange { color: #8a4b00; background: #ffe7b3; }
+    .message-priority-red { color: #a61b1b; background: #ffd6d6; }
     .message-age { color: var(--muted); font-size: 0.78rem; white-space: nowrap; }
     .message-text { margin: 0; line-height: 1.5; overflow-wrap: anywhere; }
     .message-text p { margin: 0 0 10px; }
@@ -421,6 +440,37 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       line-height: 1.45;
     }
 
+    .edit-dialog {
+      position: fixed;
+      inset: 0;
+      z-index: 9;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: rgb(23 39 34 / 28%);
+    }
+
+    .edit-dialog[hidden] { display: none; }
+
+    .edit-dialog-panel {
+      width: min(520px, 100%);
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      color: var(--ink);
+      background: var(--surface);
+      box-shadow: 0 14px 40px rgb(23 39 34 / 20%);
+    }
+
+    .edit-dialog-title { margin: 0 0 18px; font-size: 1.1rem; }
+    .edit-dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 18px;
+    }
+    .edit-dialog-actions .admin-secondary { min-height: 46px; }
+
     .empty-state {
       padding: 24px 0;
       color: var(--muted);
@@ -437,7 +487,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       line-height: 1.5;
     }
 
-    @media (max-width: 720px) {
+    @media (max-width: 780px) {
       h1 { font-size: 1.9rem; }
 
       .topbar-inner {
@@ -467,6 +517,8 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       footer { padding: 16px 20px 24px; }
       .send-button { width: 100%; }
       .clock-controls { grid-template-columns: minmax(0, 1fr); }
+      .message-search { grid-template-columns: minmax(0, 1fr) auto auto; }
+      .message-search input { grid-column: 1 / -1; }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -486,18 +538,37 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       <p id="operationDialogMessage" class="operation-dialog-message">The board is saving your change.</p>
     </div>
   </div>
+  <div id="editDialog" class="edit-dialog" role="dialog" aria-modal="true" aria-labelledby="editDialogTitle" hidden>
+    <form id="editForm" class="edit-dialog-panel">
+      <h2 id="editDialogTitle" class="edit-dialog-title">Edit message</h2>
+      <label for="editName">Name or callsign</label>
+      <input id="editName" maxlength="32" required>
+      <label for="editText">Message</label>
+      <textarea id="editText" maxlength="1024" rows="5" required></textarea>
+      <label for="editPriority">Priority</label>
+      <select id="editPriority">
+        <option value="green">Green · normal</option>
+        <option value="orange">Orange · important</option>
+        <option value="red">Red · urgent</option>
+      </select>
+      <div class="edit-dialog-actions">
+        <button id="editCancelButton" class="admin-secondary" type="button">Cancel</button>
+        <button type="submit">Save</button>
+      </div>
+    </form>
+  </div>
   <header class="topbar">
     <div class="topbar-inner">
       <div>
         <p class="eyebrow">AREDN · Local message service</p>
         <h1>Message Board</h1>
         <p class="intro">Short updates for everyone on the network.</p>
-        <p class="experimental-note">EXPERIMENTAL ESP32-S3 WEB SERVICE · APPROX. 15 SIMULTANEOUS BROWSER CONNECTIONS</p>
+        <p class="experimental-note">EXPERIMENTAL ESP32-S3 WEB SERVICE · RESOURCE-CONSCIOUS HTTP POLLING</p>
       </div>
       <div class="header-indicators">
         <div class="device-clock" aria-label="Device clock">
           <time id="deviceClock">TIME NOT SET</time>
-          <span id="deviceClockDate" class="device-clock-date">Set the clock below</span>
+          <span id="deviceClockDate" class="device-clock-date">Awaiting network time</span>
           <span id="deviceClockSource" class="device-clock-source">CLOCK STATUS UNKNOWN</span>
         </div>
         <div class="network-state" aria-live="polite">
@@ -514,7 +585,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
         <span class="section-mark">01</span>
         <h2 id="composeTitle">Write a message</h2>
       </div>
-      <div id="clockSetup" class="clock-setup">
+      <div id="clockSetup" class="clock-setup" hidden>
         <p id="clockStatus" class="clock-status" role="status" aria-live="polite">Checking for network time ...</p>
         <form id="clockForm">
           <div class="clock-controls">
@@ -529,11 +600,17 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
         <input id="author" name="name" maxlength="32" autocomplete="nickname" required>
 
         <label for="messageText">Message</label>
-        <textarea id="messageText" name="text" maxlength="512" rows="5" required></textarea>
+        <textarea id="messageText" name="text" maxlength="1024" rows="5" required></textarea>
         <div class="field-note">
-          <span>Up to 512 characters</span>
-          <span id="characterCount">0 / 512</span>
+          <span>Up to 1024 characters</span>
+          <span id="characterCount">0 / 1024</span>
         </div>
+        <label for="messagePriority">Priority</label>
+        <select id="messagePriority" name="priority">
+          <option value="green">Green · normal</option>
+          <option value="orange">Orange · important</option>
+          <option value="red">Red · urgent</option>
+        </select>
         <p class="admin-note">Optional formatting: <code># heading</code>, <code>**bold**</code>, <code>*italic*</code>, <code>- list</code></p>
 
         <button id="sendButton" class="send-button" type="submit">
@@ -551,20 +628,23 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
           <h2 id="boardTitle">Latest messages</h2>
         </div>
         <div class="board-actions">
-          <a id="exportButton" class="refresh-button" href="/api/messages/export.json" download="aredn-messages.json" title="Download all stored messages as JSON">Export Messages</a>
-          <button id="refreshButton" class="refresh-button" type="button" title="Refresh messages">
-            Refresh
-          </button>
+          <a id="exportButton" class="board-action-button" href="/api/messages/export.json" download="aredn-messages.json" title="Download all stored messages as JSON">Export Messages</a>
         </div>
       </div>
       <p id="feedInfo" class="feed-info" aria-live="polite">Loading messages ...</p>
       <form id="searchForm" class="message-search">
         <input id="searchInput" type="search" maxlength="64" placeholder="Search name or message" aria-label="Search name or message">
+        <select id="priorityFilter" aria-label="Filter by priority">
+          <option value="all">All priorities</option>
+          <option value="green">Green</option>
+          <option value="orange">Orange</option>
+          <option value="red">Red</option>
+        </select>
         <button type="submit">Search</button>
         <button id="clearSearchButton" class="admin-secondary" type="button">Clear</button>
       </form>
       <div id="messageList" class="message-list" aria-live="polite"></div>
-      <button id="loadMoreButton" class="refresh-button" type="button" hidden>Load more</button>
+      <button id="loadMoreButton" class="board-action-button" type="button" hidden>Load more</button>
       <p id="emptyState" class="empty-state" hidden>No messages yet. Post the first one.</p>
     </section>
 
@@ -593,6 +673,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
     const form = document.getElementById('messageForm');
     const authorInput = document.getElementById('author');
     const messageInput = document.getElementById('messageText');
+    const messagePriorityInput = document.getElementById('messagePriority');
     const sendButton = document.getElementById('sendButton');
     const sendSpinner = document.getElementById('sendSpinner');
     const sendLabel = document.getElementById('sendLabel');
@@ -602,6 +683,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
     const feedInfo = document.getElementById('feedInfo');
     const searchForm = document.getElementById('searchForm');
     const searchInput = document.getElementById('searchInput');
+    const priorityFilter = document.getElementById('priorityFilter');
     const clearSearchButton = document.getElementById('clearSearchButton');
     const loadMoreButton = document.getElementById('loadMoreButton');
     const networkDot = document.getElementById('networkDot');
@@ -623,6 +705,12 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
     const operationDialog = document.getElementById('operationDialog');
     const operationDialogTitle = document.getElementById('operationDialogTitle');
     const operationDialogMessage = document.getElementById('operationDialogMessage');
+    const editDialog = document.getElementById('editDialog');
+    const editForm = document.getElementById('editForm');
+    const editName = document.getElementById('editName');
+    const editText = document.getElementById('editText');
+    const editPriority = document.getElementById('editPriority');
+    const editCancelButton = document.getElementById('editCancelButton');
 
     let acceptedId = null;
     let retryCount = 0;
@@ -640,16 +728,17 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
     let oldestMessageId = 0;
     let moreMessagesAvailable = false;
     let boardRevision = null;
-    let eventSource = null;
-    let eventStreamWasOpened = false;
-    let fallbackTimer = 0;
-    let pushConnected = false;
-    let lastPushAt = 0;
     let refreshRequested = false;
     let requestedRefreshMode = 'after';
     let viewGeneration = 0;
     let searchActive = false;
     let searchTerm = '';
+    let selectedPriority = 'all';
+    let editDialogResolve = null;
+    const POLL_INTERVAL_MS = 30000;
+    const POLL_JITTER_MS = 3000;
+    const POLL_MIN_DELAY_MS = 1000;
+    let pollTimer = 0;
     sendButton.disabled = true;
 
     function showOperationDialog(title, message) {
@@ -660,6 +749,37 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
 
     function hideOperationDialog() {
       operationDialog.hidden = true;
+    }
+
+    function uploadImportFile(file, totalMessages) {
+      return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open('POST', '/api/admin/import');
+        request.setRequestHeader('Content-Type', 'application/json');
+        request.upload.addEventListener('progress', (event) => {
+          if (!event.lengthComputable || totalMessages === 0) return;
+          const uploadedMessages = Math.min(
+            totalMessages,
+            Math.floor((event.loaded / event.total) * totalMessages));
+          operationDialogMessage.textContent =
+            `Importing messages: ${uploadedMessages} / ${totalMessages}`;
+        });
+        request.upload.addEventListener('load', () => {
+          if (totalMessages > 0) {
+            operationDialogMessage.textContent = `Importing messages: ${totalMessages} / ${totalMessages}`;
+          }
+          window.setTimeout(() => {
+            operationDialogMessage.textContent = 'Import is being processed ...';
+          }, 0);
+        });
+        request.addEventListener('load', () => {
+          resolve(request);
+        });
+        request.addEventListener('error', () => {
+          reject(new Error('Import upload failed'));
+        });
+        request.send(file);
+      });
     }
 
     async function exportMessages(event) {
@@ -679,15 +799,26 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
             throw new Error('Export page failed');
           }
           const page = await response.json();
-          storedCount = page.message_count;
-          messages.push(...page.messages);
-          hasMore = page.has_more;
+          storedCount = page.c;
+          messages.push(...page.p.map((message) => {
+            const exportedMessage = {
+              id: message.i,
+              created_at: new Date(message.t * 1000).toISOString(),
+              name: message.u,
+              text: message.m
+            };
+            if (message.p && message.p !== 'green') {
+              exportedMessage.priority = message.p;
+            }
+            return exportedMessage;
+          }));
+          hasMore = page.h;
           if (hasMore) {
-            const lastMessage = page.messages[page.messages.length - 1];
+            const lastMessage = page.p[page.p.length - 1];
             if (!lastMessage) {
               throw new Error('Export pagination failed');
             }
-            beforeId = lastMessage.id;
+            beforeId = lastMessage.i;
             operationDialogMessage.textContent =
               `Preparing ${messages.length} of ${storedCount} messages ...`;
           }
@@ -714,9 +845,10 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
 
     function setBusy(busy, label) {
       messageSending = busy;
-      sendButton.disabled = busy || !deviceClockSet;
+      sendButton.disabled = busy;
       authorInput.disabled = busy;
       messageInput.disabled = busy;
+      messagePriorityInput.disabled = busy;
       sendSpinner.hidden = !busy;
       sendButtonLabel = label;
       sendLabel.textContent = sendButtonLabel;
@@ -731,6 +863,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       adminAuthenticated = authenticated;
       adminLoginForm.hidden = authenticated;
       adminControls.hidden = !authenticated;
+      clockSetup.hidden = !authenticated;
       adminStatus.textContent = statusText;
       adminStatus.classList.remove('error');
     }
@@ -771,7 +904,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
 
     function updateClockState(isSet, source, epoch) {
       deviceClockSet = isSet && Number.isFinite(epoch) && epoch > 0;
-      sendButton.disabled = messageSending || !deviceClockSet;
+      sendButton.disabled = messageSending;
 
       if (deviceClockSet) {
         clockEpochMs = epoch * 1000;
@@ -781,19 +914,19 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       }
       renderHeaderClock();
 
-      if (deviceClockSet && source === 'network') {
+      if (deviceClockSet && source === 'client') {
+        deviceClockSource.textContent = 'MESH TIME';
+        clockStatus.textContent = 'Device clock synchronized from AREDN mesh clients.';
+      } else if (deviceClockSet && source === 'network') {
         deviceClockSource.textContent = 'NETWORK TIME';
         clockStatus.textContent = 'Device clock synchronized with network time.';
-        clockSetup.hidden = true;
       } else if (deviceClockSet) {
         deviceClockSource.textContent = 'MANUALLY SET';
         clockStatus.textContent = 'Device time was set manually. It will be checked for network time again; set it again after a restart if needed.';
-        clockSetup.hidden = false;
       } else {
         deviceClockSource.textContent = 'TIME NOT SET';
-        deviceClockDate.textContent = 'Set the clock below';
-        clockStatus.textContent = 'Network time is unavailable. Set the device date and time manually to enable message posting.';
-        clockSetup.hidden = false;
+        deviceClockDate.textContent = 'Awaiting network time';
+        clockStatus.textContent = 'Network time is unavailable. An administrator can set the device date and time below.';
       }
     }
 
@@ -895,22 +1028,31 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
 
       for (const message of messages) {
         const article = document.createElement('article');
-        article.className = 'message';
+        const priority = message.p || 'green';
+        article.className = `message priority-${priority}`;
 
         const meta = document.createElement('div');
         meta.className = 'message-meta';
         const author = document.createElement('span');
         author.className = 'message-name';
-        author.textContent = message.name;
+        author.textContent = message.u;
+        if (priority !== 'green') {
+          const priorityLabel = document.createElement('span');
+          priorityLabel.className = `message-priority message-priority-${priority}`;
+          priorityLabel.textContent = priority;
+          priorityLabel.setAttribute('aria-label', `Priority ${priority}`);
+          author.append(' · ', priorityLabel);
+        }
         const age = document.createElement('time');
         age.className = 'message-age';
-        age.dateTime = message.created_at;
-        age.textContent = new Date(message.created_at).toLocaleString('en-GB');
+        const messageDate = new Date(message.t * 1000);
+        age.dateTime = messageDate.toISOString();
+        age.textContent = messageDate.toLocaleString();
         meta.append(author, age);
 
         const text = document.createElement('div');
         text.className = 'message-text';
-        text.append(renderMarkdown(message.text));
+        text.append(renderMarkdown(message.m));
         article.append(meta, text);
         if (adminAuthenticated) {
           const actions = document.createElement('div');
@@ -922,7 +1064,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
           const deleteButton = document.createElement('button');
           deleteButton.type = 'button';
           deleteButton.textContent = 'Delete';
-          deleteButton.addEventListener('click', () => deleteMessage(message.id));
+          deleteButton.addEventListener('click', () => deleteMessage(message.i));
           actions.append(editButton, deleteButton);
           article.append(actions);
         }
@@ -931,15 +1073,15 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
     }
 
     function mergeMessages(messages, replaceAll) {
-      const messageMap = new Map(replaceAll ? [] : loadedMessages.map((message) => [message.id, message]));
+      const messageMap = new Map(replaceAll ? [] : loadedMessages.map((message) => [message.i, message]));
       for (const message of messages) {
-        messageMap.set(message.id, message);
+        messageMap.set(message.i, message);
       }
-      loadedMessages = [...messageMap.values()].sort((left, right) => right.id - left.id);
-      latestMessageId = loadedMessages.length === 0 ? 0 : loadedMessages[0].id;
+      loadedMessages = [...messageMap.values()].sort((left, right) => right.i - left.i);
+      latestMessageId = loadedMessages.length === 0 ? 0 : loadedMessages[0].i;
       oldestMessageId = loadedMessages.length === 0
         ? 0
-        : loadedMessages[loadedMessages.length - 1].id;
+        : loadedMessages[loadedMessages.length - 1].i;
       renderMessages(loadedMessages);
     }
 
@@ -963,17 +1105,39 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       }
     }
 
+    function openEditDialog(message) {
+      editName.value = message.u;
+      editText.value = message.m;
+      editPriority.value = message.p || 'green';
+      editDialog.hidden = false;
+      editName.focus();
+      return new Promise((resolve) => {
+        editDialogResolve = resolve;
+      });
+    }
+
+    function closeEditDialog(result) {
+      editDialog.hidden = true;
+      if (editDialogResolve !== null) {
+        const resolve = editDialogResolve;
+        editDialogResolve = null;
+        resolve(result);
+      }
+    }
+
     async function editMessage(message) {
-      const name = window.prompt('Name or callsign', message.name);
-      if (name === null) return;
-      const text = window.prompt('Message', message.text);
-      if (text === null) return;
+      const values = await openEditDialog(message);
+      if (values === null) return;
       showOperationDialog('Saving message', 'The board is writing the updated message.');
       try {
-        const response = await fetch(`/api/admin/message?id=${message.id}`, {
+        const response = await fetch(`/api/admin/message?id=${message.i}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ name: name.trim(), text: text.trim() })
+          body: new URLSearchParams({
+            name: values.name.trim(),
+            text: values.text.trim(),
+            priority: values.priority
+          })
         });
         if (response.status === 401) {
           setAdminState(false, 'Your admin session has expired.');
@@ -991,6 +1155,17 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
         hideOperationDialog();
       }
     }
+
+    editForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      closeEditDialog({
+        name: editName.value,
+        text: editText.value,
+        priority: editPriority.value
+      });
+    });
+
+    editCancelButton.addEventListener('click', () => closeEditDialog(null));
 
     async function deleteMessage(id) {
       if (!window.confirm('Delete this message?')) return;
@@ -1014,6 +1189,11 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       }
     }
 
+    function addClientTime(endpoint) {
+      const separator = endpoint.includes('?') ? '&' : '?';
+      return `${endpoint}${separator}c_time=${Math.floor(Date.now() / 1000)}`;
+    }
+
     async function refreshMessages(mode = 'after') {
       if (refreshInProgress) {
         refreshRequested = true;
@@ -1028,48 +1208,50 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       updateLoadMoreState();
       try {
         const isIncremental = mode === 'after' && latestMessageId !== 0;
-        let endpoint = '/api/messages?limit=50';
+        const priorityQuery = selectedPriority === 'all'
+          ? '' : `&priority=${encodeURIComponent(selectedPriority)}`;
+        let endpoint = `/api/messages?limit=50${priorityQuery}`;
         if (mode === 'search') {
-          endpoint = `/api/messages?search=${encodeURIComponent(searchTerm)}&limit=50`;
+          endpoint = `/api/messages?search=${encodeURIComponent(searchTerm)}&limit=50${priorityQuery}`;
         } else if (mode === 'full') {
-          endpoint = '/api/messages?limit=50';
+          endpoint = `/api/messages?limit=50${priorityQuery}`;
         } else if (isIncremental) {
-          endpoint = `/api/messages?after=${latestMessageId}&limit=50`;
+          endpoint = `/api/messages?after=${latestMessageId}&limit=50${priorityQuery}`;
         } else if (mode === 'before' && oldestMessageId !== 0) {
           endpoint = `/api/messages?before=${oldestMessageId}&limit=50` +
-            (searchActive ? `&search=${encodeURIComponent(searchTerm)}` : '');
+            (searchActive ? `&search=${encodeURIComponent(searchTerm)}` : '') + priorityQuery;
         }
-        const response = await fetch(endpoint, { cache: 'no-store' });
+        const response = await fetch(addClientTime(endpoint), { cache: 'no-store' });
         if (!response.ok) throw new Error('Board unavailable');
         const data = await response.json();
         if (requestGeneration !== viewGeneration) {
           return;
         }
-        const revisionChanged = boardRevision !== null && data.revision !== boardRevision;
-        if (revisionChanged && mode !== 'full') {
+        const revisionChanged = boardRevision !== null && data.r !== boardRevision;
+        if (revisionChanged && data.f && mode !== 'full') {
           refreshInProgress = false;
           updateLoadMoreState();
           await refreshMessages(mode === 'search' ? 'search' : 'full');
           return;
         }
-        boardRevision = data.revision;
+        boardRevision = data.r;
         const appendPage = mode === 'before';
-        mergeMessages(data.messages, !appendPage &&
+        mergeMessages(data.p, !appendPage &&
           (mode === 'full' || mode === 'search' || !isIncremental));
-        moreMessagesAvailable = isIncremental ? moreMessagesAvailable : data.has_more;
+        moreMessagesAvailable = isIncremental ? moreMessagesAvailable : data.h;
         updateLoadMoreState();
-        updateClockState(data.clock_valid, data.clock_source, data.clock_epoch);
+        updateClockState(data.v, data.s, data.e);
+        const filterLabel = selectedPriority === 'all' ? '' : ` · ${selectedPriority}`;
         feedInfo.textContent = searchActive
-          ? `Search results for "${searchTerm}" · ${loadedMessages.length}${data.has_more ? '+' : ''} matches`
-          : `${loadedMessages.length} shown · ${data.message_count} stored posts` +
-            (data.pending ? ` · ${data.pending} being processed` : '');
+          ? `Search results for "${searchTerm}"${filterLabel} · ${loadedMessages.length}${data.h ? '+' : ''} matches`
+          : `${loadedMessages.length} shown${filterLabel} · ${data.c} stored posts`;
         setNetworkState(true);
 
-        if (acceptedId !== null && loadedMessages.some((message) => message.id === acceptedId)) {
+        if (acceptedId !== null && loadedMessages.some((message) => message.i === acceptedId)) {
           acceptedId = null;
           clearTimeout(retryTimer);
           form.reset();
-          document.getElementById('characterCount').textContent = '0 / 512';
+          document.getElementById('characterCount').textContent = '0 / 1024';
           setBusy(false, 'Post message');
           setFormStatus('Your message is now on the board.');
         }
@@ -1089,71 +1271,24 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       }
     }
 
-    function requestRefresh(mode = 'after') {
+    function requestRefresh(mode = searchActive ? 'search' : 'after') {
       return refreshMessages(mode);
+    }
+
+    function scheduleNextPoll() {
+      const jitterMs = Math.random() * 2 * POLL_JITTER_MS - POLL_JITTER_MS;
+      const delayMs = Math.max(POLL_MIN_DELAY_MS, POLL_INTERVAL_MS + jitterMs);
+      pollTimer = window.setTimeout(async () => {
+        pollTimer = 0;
+        if (!document.hidden) {
+          await requestRefresh();
+        }
+        scheduleNextPoll();
+      }, delayMs);
     }
 
     async function loadMoreMessages() {
       await refreshMessages('before');
-    }
-
-    function scheduleFallback(delay = 5000) {
-      if (fallbackTimer !== 0 || pushConnected) return;
-      fallbackTimer = window.setTimeout(async () => {
-        fallbackTimer = 0;
-        if (!pushConnected) {
-          await requestRefresh();
-          scheduleFallback();
-        }
-      }, delay);
-    }
-
-    function startEventStream() {
-      if (!('EventSource' in window)) {
-        scheduleFallback(0);
-        return;
-      }
-
-      eventSource = new EventSource('/api/events');
-      eventSource.onopen = () => {
-        const reconnecting = eventStreamWasOpened;
-        eventStreamWasOpened = true;
-        pushConnected = true;
-        lastPushAt = performance.now();
-        if (fallbackTimer !== 0) {
-          clearTimeout(fallbackTimer);
-          fallbackTimer = 0;
-        }
-        requestRefresh(reconnecting ? 'full' : 'after');
-      };
-      eventSource.onerror = () => {
-        pushConnected = false;
-        scheduleFallback(1000);
-      };
-      eventSource.addEventListener('heartbeat', () => {
-        lastPushAt = performance.now();
-      });
-      eventSource.addEventListener('sync', () => {
-        lastPushAt = performance.now();
-      });
-      eventSource.addEventListener('message_changed', () => {
-        lastPushAt = performance.now();
-        requestRefresh(searchActive ? 'search' : 'after');
-      });
-      eventSource.addEventListener('board_changed', () => {
-        lastPushAt = performance.now();
-        requestRefresh(searchActive ? 'search' : 'full');
-      });
-    }
-
-    function checkEventStream() {
-      if (!pushConnected || performance.now() - lastPushAt <= 45000) return;
-      pushConnected = false;
-      if (eventSource !== null) {
-        eventSource.close();
-      }
-      scheduleFallback(0);
-      window.setTimeout(startEventStream, 5000);
     }
 
     function watchAcceptedMessage() {
@@ -1162,12 +1297,16 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
     }
 
     async function submitMessage() {
-      const body = new URLSearchParams({ name: authorInput.value.trim(), text: messageInput.value.trim() });
       try {
         const response = await fetch('/api/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body
+          body: new URLSearchParams({
+            name: authorInput.value.trim(),
+            text: messageInput.value.trim(),
+            priority: messagePriorityInput.value,
+            c_time: String(Math.floor(Date.now() / 1000))
+          })
         });
 
         if (response.status === 429) {
@@ -1184,7 +1323,9 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
           setBusy(false, 'Try again');
           setFormStatus(data.error === 'too_long'
             ? 'The name or message is too long.'
-            : 'The message was not accepted. Your text is still in the form.', true);
+            : data.error === 'board_full'
+              ? 'The message board is full. Delete an older message before posting again.'
+              : 'The message was not accepted. Your text is still in the form.', true);
           return;
         }
 
@@ -1202,7 +1343,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
 
     form.addEventListener('submit', (event) => {
       event.preventDefault();
-      if (acceptedId !== null || sendButton.disabled) return;
+      if (acceptedId !== null || messageSending) return;
       retryCount = 0;
       setBusy(true, 'Sending');
       setFormStatus('');
@@ -1210,7 +1351,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
     });
 
     messageInput.addEventListener('input', () => {
-      document.getElementById('characterCount').textContent = `${messageInput.value.length} / 512`;
+      document.getElementById('characterCount').textContent = `${messageInput.value.length} / 1024`;
     });
 
     function resetMessageView() {
@@ -1245,12 +1386,18 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       requestRefresh('latest');
     });
 
-    document.getElementById('refreshButton').addEventListener('click', refreshMessages);
+    priorityFilter.addEventListener('change', () => {
+      selectedPriority = priorityFilter.value;
+      ++viewGeneration;
+      resetMessageView();
+      requestRefresh(searchActive ? 'search' : 'latest');
+    });
+
     exportButton.addEventListener('click', exportMessages);
     loadMoreButton.addEventListener('click', loadMoreMessages);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
-        requestRefresh('full');
+        requestRefresh(searchActive ? 'search' : 'full');
       }
     });
     adminLoginForm.addEventListener('submit', async (event) => {
@@ -1303,23 +1450,46 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       adminStatus.textContent = 'Importing messages ...';
       showOperationDialog('Importing messages', 'The board is validating and installing the imported store.');
       try {
-        const response = await fetch('/api/admin/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: file
-        });
+        let totalMessages = 0;
+        try {
+          const archive = JSON.parse(await file.text());
+          totalMessages = Array.isArray(archive.messages) ? archive.messages.length : 0;
+        } catch (error) {
+        }
+        if (totalMessages > 0) {
+          operationDialogMessage.textContent = `Importing messages: 0 / ${totalMessages}`;
+        }
+        let response;
+        try {
+          response = await uploadImportFile(file, totalMessages);
+        } catch (error) {
+          setAdminError('Import may have completed, but the connection was lost.');
+          return;
+        }
         if (response.status === 401) {
           setAdminState(false, 'Your admin session has expired.');
           return;
         }
-        if (!response.ok) {
-          setAdminError('Import failed. The message board may be empty.');
+        if (response.status < 200 || response.status >= 300) {
+          const responseText = response.responseText;
+          let reason = responseText;
+          try {
+            const error = JSON.parse(responseText);
+            reason = error.reason || error.error || responseText;
+          } catch (error) {
+          }
+          const detail = reason ? ` (${reason})` : '';
+          setAdminError(`Import failed${detail}.`);
           return;
         }
-        await refreshMessages('full');
         adminStatus.textContent = 'Messages imported.';
+        try {
+          await refreshMessages('full');
+        } catch (error) {
+          setAdminError('Messages imported, but the board display could not be refreshed.');
+        }
       } catch (error) {
-        setAdminError('Import failed. Check the connection.');
+        setAdminError('Import status could not be determined.');
       } finally {
         hideOperationDialog();
       }
@@ -1341,18 +1511,25 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body
         });
-        if (!response.ok) throw new Error('Could not set device time');
+        if (response.status === 401) {
+          setAdminState(false, 'Your admin session has expired.');
+          return;
+        }
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.error === 'clock_busy'
+            ? 'The device clock is busy. Try again in a moment.'
+            : 'Could not set device time.');
+        }
         await refreshMessages();
       } catch (error) {
-        clockStatus.textContent = 'Could not set device time. Check the connection and try again.';
+        clockStatus.textContent = `${error.message} Check the connection and try again.`;
       }
     });
 
     refreshAdminState();
-    refreshMessages();
-    startEventStream();
+    refreshMessages().then(scheduleNextPoll);
     setInterval(renderHeaderClock, 1000);
-    setInterval(checkEventStream, 5000);
   </script>
 </body>
 </html>

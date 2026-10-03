@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AREDN Firmware Flasher</title>
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <p class="eyebrow">AREDN NODE TOOLS</p>
+        <h1>Flash firmware</h1>
+        <p class="intro">Choose a firmware release, connect the board over USB, and install it directly from your browser.</p>
+      </header>
+
+      <section class="panel">
+        <label class="file-picker">
+          <span>Firmware release</span>
+          <select id="releaseSelect"></select>
+        </label>
+        <p id="onlineStatus" class="status">Loading available releases ...</p>
+        <p id="releaseStatus" class="status">No release selected.</p>
+        <dl id="releaseDetails" class="details" hidden></dl>
+      </section>
+
+      <section class="panel actions">
+        <button id="flashButton" type="button" disabled>Connect board and flash</button>
+        <p id="connectionStatus" class="status">Use Chrome or Edge with WebUSB enabled.</p>
+        <progress id="flashProgress" max="100" value="0" hidden></progress>
+        <p id="progressStatus" class="status" hidden></p>
+      </section>
+
+      <section class="panel log-panel">
+        <h2>Log</h2>
+        <pre id="log" aria-live="polite"></pre>
+      </section>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -18,22 +18,31 @@ public:
   static constexpr const char* REPAIR_PATH = "/messages.repair";
   static constexpr const char* BACKUP_PATH = "/messages.backup";
   static constexpr const char* IMPORT_PATH = "/messages.import";
-  static constexpr const char* INCOMPATIBLE_PATH = "/messages.incompatible";
   static constexpr size_t MAX_NAME_LENGTH = 32;
-  static constexpr size_t MAX_MESSAGE_LENGTH = 512;
+  static constexpr size_t MAX_MESSAGE_LENGTH = 1024;
+  static constexpr size_t MAX_INDEXED_MESSAGES = 4096;
 
   struct Message
   {
     uint32_t id;
     int64_t createdAtEpoch;
+    uint8_t priority;
     char name[MAX_NAME_LENGTH + 1];
     char text[MAX_MESSAGE_LENGTH + 1];
+  };
+
+  enum class Priority : uint8_t
+  {
+    Green,
+    Orange,
+    Red
   };
 
   enum class SubmitResult
   {
     Accepted,
     Invalid,
+    Full,
     Unavailable
   };
 
@@ -51,7 +60,10 @@ public:
     }
     if (index_ == nullptr)
     {
-      indexCapacity_ = FFat.totalBytes() / sizeof(DiskRecord);
+      const size_t storageCapacity = FFat.totalBytes() / sizeof(DiskRecord);
+      indexCapacity_ = storageCapacity < MAX_INDEXED_MESSAGES
+          ? storageCapacity
+          : MAX_INDEXED_MESSAGES;
       index_ = indexCapacity_ == 0 ? nullptr : new (std::nothrow) IndexEntry[indexCapacity_];
       if (index_ == nullptr)
       {
@@ -99,10 +111,7 @@ public:
     if (!isCurrentHeader(header))
     {
       file.close();
-      if (FFat.exists(INCOMPATIBLE_PATH) || !FFat.rename(FILE_PATH, INCOMPATIBLE_PATH))
-      {
-        return false;
-      }
+      FFat.remove(FILE_PATH);
       file = FFat.open(FILE_PATH, FILE_WRITE);
       const bool initialized = file && writeHeader(file);
       if (file)
@@ -112,7 +121,6 @@ public:
       if (!initialized)
       {
         FFat.remove(FILE_PATH);
-        FFat.rename(INCOMPATIBLE_PATH, FILE_PATH);
         return false;
       }
       return true;
@@ -199,12 +207,14 @@ public:
 
   bool ready() const
   {
-    return mutex_ != nullptr && FFat.totalBytes() > 0;
+    return mutex_ != nullptr && index_ != nullptr &&
+           indexCapacity_ > 0 && FFat.totalBytes() > 0;
   }
 
   SubmitResult enqueue(const char* name,
                        const char* text,
                        int64_t createdAtEpoch,
+                       Priority priority,
                        uint32_t& id)
   {
     if (!ready() || importInProgress_)
@@ -231,44 +241,37 @@ public:
     if (messageCount_ >= indexCapacity_)
     {
       xSemaphoreGive(mutex_);
-      return SubmitResult::Unavailable;
+      return SubmitResult::Full;
     }
 
     DiskRecord record{};
     record.magic = RECORD_MAGIC;
     record.id = nextId_;
     record.createdAtEpoch = createdAtEpoch;
+    record.priority = static_cast<uint8_t>(priority);
     record.nameLength = static_cast<uint8_t>(nameLength);
     record.textLength = static_cast<uint16_t>(textLength);
     memcpy(record.name, name, nameLength);
     memcpy(record.text, text, textLength);
     record.checksum = checksum(record);
 
-    if (!appendFile_)
-    {
-      appendFile_ = FFat.open(FILE_PATH, FILE_APPEND);
-    }
-    const bool written = appendFile_ && appendFile_.write(
-        reinterpret_cast<const uint8_t*>(&record), sizeof(record)) == sizeof(record);
+    appendFile_.close();
+    appendFile_ = FFat.open(FILE_PATH, FILE_APPEND);
+    const size_t offset = appendFile_ ? appendFile_.size() : 0;
+    const bool written = appendFile_ &&
+        appendFile_.write(reinterpret_cast<const uint8_t*>(&record), sizeof(record)) == sizeof(record);
     if (written)
     {
       appendFile_.flush();
     }
-
-    if (!written)
+    appendFile_.close();
+    if (!written || !appendIndexEntry(record.id, offset))
     {
       xSemaphoreGive(mutex_);
       return SubmitResult::Unavailable;
     }
 
     id = record.id;
-    if (!appendIndexEntry(record.id,
-                sizeof(StorageHeader) +
-                  static_cast<size_t>(messageCount_) * sizeof(DiskRecord)))
-    {
-      xSemaphoreGive(mutex_);
-      return SubmitResult::Unavailable;
-    }
     nextId_ = nextId_ == UINT32_MAX ? 1 : nextId_ + 1;
     ++messageCount_;
     xSemaphoreGive(mutex_);
@@ -283,70 +286,58 @@ public:
     }
 
     appendFile_.close();
-    File file = FFat.open(FILE_PATH, FILE_WRITE);
-    const bool success = file && writeHeader(file);
-    if (file)
+    File replacement = FFat.open(REPAIR_PATH, FILE_WRITE);
+    bool success = replacement && writeHeader(replacement);
+    if (success)
     {
-      file.close();
+      replacement.flush();
+    }
+    if (replacement)
+    {
+      replacement.close();
     }
     if (success)
     {
-      messageCount_ = 0;
-      nextId_ = 1;
+      success = installRepairFile();
+    }
+    if (success)
+    {
       clearIndex();
-      FFat.remove(INCOMPATIBLE_PATH);
+      nextId_ = 1;
     }
     xSemaphoreGive(mutex_);
     return success;
   }
 
-  bool update(uint32_t id, const char* name, const char* text)
+  bool update(uint32_t id, const char* name, const char* text, Priority priority)
   {
-    return rewrite(id, name, text, false);
+    return rewrite(id, name, text, priority, false);
   }
 
   bool remove(uint32_t id)
   {
-    return rewrite(id, nullptr, nullptr, true);
+    return rewrite(id, nullptr, nullptr, Priority::Green, true);
   }
 
   bool beginImport(size_t expectedBytes)
   {
+    importError_ = "none";
     if (!ready() || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
     {
+      importError_ = "board_unavailable";
       return false;
     }
     if (importInProgress_)
     {
+      importError_ = "already_in_progress";
       xSemaphoreGive(mutex_);
       return false;
     }
-    esp_task_wdt_delete(nullptr);
     appendFile_.close();
-    FFat.end();
-    if (!FFat.format())
-    {
-      esp_task_wdt_add(nullptr);
-      xSemaphoreGive(mutex_);
-      return false;
-    }
-    FFat.end();
-    if (!FFat.begin(false))
-    {
-      esp_task_wdt_add(nullptr);
-      xSemaphoreGive(mutex_);
-      return false;
-    }
-    esp_task_wdt_add(nullptr);
-    File currentFile = FFat.open(FILE_PATH, FILE_READ);
-    const size_t currentSize = currentFile ? currentFile.size() : 0;
-    if (currentFile)
-    {
-      currentFile.close();
-    }
     const size_t freeBytes = FFat.totalBytes() - FFat.usedBytes();
-    if (expectedBytes > freeBytes || currentSize > freeBytes - expectedBytes)
+    if (expectedBytes > freeBytes)
     {
+      importError_ = "upload_too_large";
       xSemaphoreGive(mutex_);
       return false;
     }
@@ -356,6 +347,7 @@ public:
     importInProgress_ = static_cast<bool>(importFile_);
     if (!importInProgress_)
     {
+      importError_ = "import_file_open_failed";
       FFat.remove(IMPORT_PATH);
     }
     xSemaphoreGive(mutex_);
@@ -383,10 +375,12 @@ public:
   {
     if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
     {
+      importError_ = "mutex_unavailable";
       return false;
     }
     if (!importInProgress_)
     {
+      importError_ = "not_in_progress";
       xSemaphoreGive(mutex_);
       return false;
     }
@@ -394,11 +388,14 @@ public:
     importFile_.flush();
     importFile_.close();
 
+    FFat.remove(BACKUP_PATH);
     File source = FFat.open(IMPORT_PATH, FILE_READ);
     File replacement = FFat.open(REPAIR_PATH, FILE_WRITE);
+    const bool sourceOpened = static_cast<bool>(source);
+    const bool replacementOpened = static_cast<bool>(replacement);
     uint32_t importedCount = 0;
     uint32_t highestId = 0;
-    bool success = source && replacement && writeHeader(replacement) &&
+    bool success = sourceOpened && replacementOpened && writeHeader(replacement) &&
         parseImport(source, replacement, importedCount, highestId);
     if (success)
     {
@@ -417,23 +414,36 @@ public:
       success = installRepairFile();
       if (success)
       {
+        FFat.remove(BACKUP_PATH);
         nextId_ = highestId == UINT32_MAX ? 1 : highestId + 1;
         success = rebuildIndex();
         if (!success)
         {
+          importError_ = "index_rebuild_failed";
           messageCount_ = importedCount;
         }
-        FFat.remove(INCOMPATIBLE_PATH);
       }
     }
     else
     {
+      importError_ = !sourceOpened ? "import_file_open_failed"
+          : !replacementOpened ? "repair_file_open_failed"
+          : "json_parse_failed";
       FFat.remove(REPAIR_PATH);
     }
     FFat.remove(IMPORT_PATH);
     importInProgress_ = false;
+    if (success)
+    {
+      importError_ = "none";
+    }
     xSemaphoreGive(mutex_);
     return success;
+  }
+
+  const char* importError() const
+  {
+    return importError_;
   }
 
   void abortImport()
@@ -445,16 +455,6 @@ public:
       importInProgress_ = false;
       xSemaphoreGive(mutex_);
     }
-  }
-
-  uint8_t processPending()
-  {
-    return 0;
-  }
-
-  uint32_t pending() const
-  {
-    return 0;
   }
 
   uint32_t messageCount() const
@@ -491,6 +491,26 @@ public:
     return FFat.totalBytes();
   }
 
+  size_t freeBytes() const
+  {
+    return FFat.totalBytes() - FFat.usedBytes();
+  }
+
+  size_t recordSize() const
+  {
+    return sizeof(DiskRecord);
+  }
+
+  size_t indexCapacity() const
+  {
+    return indexCapacity_;
+  }
+
+  size_t indexBytes() const
+  {
+    return indexCapacity_ * sizeof(IndexEntry);
+  }
+
   bool openReader(File& file) const
   {
     if (mutex_ == nullptr || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
@@ -512,16 +532,16 @@ public:
     {
       return false;
     }
-    if (openReaderUnlocked(file))
+    if (!openReaderUnlocked(file))
     {
-      return true;
+      if (file)
+      {
+        file.close();
+      }
+      xSemaphoreGive(mutex_);
+      return false;
     }
-    if (file)
-    {
-      file.close();
-    }
-    xSemaphoreGive(mutex_);
-    return false;
+    return true;
   }
 
   void closeReaderExclusive(File& file) const
@@ -544,6 +564,7 @@ public:
 
     message.id = record.id;
     message.createdAtEpoch = record.createdAtEpoch;
+    message.priority = record.priority;
     memcpy(message.name, record.name, record.nameLength);
     message.name[record.nameLength] = '\0';
     memcpy(message.text, record.text, record.textLength);
@@ -569,31 +590,27 @@ public:
 
   bool readLatest(Message& message) const
   {
-    File file;
-    if (!openReader(file))
+    if (mutex_ == nullptr || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
     {
       return false;
     }
 
-    bool found = false;
-    for (uint32_t index = 0; index < messageCount_; ++index)
+    File file;
+    const bool found = messageCount_ != 0 && openReaderUnlocked(file) &&
+        readAtUnlocked(file, messageCount_ - 1, message);
+    if (file)
     {
-      Message candidate{};
-      if (readAt(file, index, candidate) &&
-          (!found || candidate.id > message.id))
-      {
-        message = candidate;
-        found = true;
-      }
+      file.close();
     }
-    file.close();
+    xSemaphoreGive(mutex_);
     return found;
   }
 
 private:
   static constexpr uint32_t RECORD_MAGIC = 0x41524D31;
   static constexpr uint32_t STORAGE_MAGIC = 0x41524631;
-  static constexpr uint16_t CURRENT_FORMAT_VERSION = 1;
+  static constexpr uint16_t CURRENT_FORMAT_VERSION = 2;
+  static constexpr uint32_t MAX_IMPORTED_MESSAGES = MAX_INDEXED_MESSAGES - 1;
 
   struct __attribute__((packed)) StorageHeader
   {
@@ -609,6 +626,7 @@ private:
     uint32_t magic;
     uint32_t id;
     int64_t createdAtEpoch;
+    uint8_t priority;
     uint8_t nameLength;
     uint16_t textLength;
     char name[MAX_NAME_LENGTH];
@@ -621,6 +639,17 @@ private:
     uint32_t id;
     size_t offset;
   };
+
+  static void copyRecordToMessage(const DiskRecord& record, Message& message)
+  {
+    message.id = record.id;
+    message.createdAtEpoch = record.createdAtEpoch;
+    message.priority = record.priority;
+    memcpy(message.name, record.name, record.nameLength);
+    message.name[record.nameLength] = '\0';
+    memcpy(message.text, record.text, record.textLength);
+    message.text[record.textLength] = '\0';
+  }
 
   bool appendIndexEntry(uint32_t id, size_t offset)
   {
@@ -699,10 +728,14 @@ private:
 
   bool readAtUnlocked(File& file, uint32_t index, Message& message) const
   {
-    return file &&
-        index_ != nullptr && index < messageCount_ &&
-        file.seek(index_[index].offset) &&
-        readNext(file, message);
+    if (!file || index >= messageCount_ || index_[index].id == 0 ||
+      !file.seek(index_[index].offset))
+      {
+        return false;
+      }
+    DiskRecord record{};
+    return file.read(reinterpret_cast<uint8_t*>(&record), sizeof(record)) == sizeof(record) &&
+      isValid(record) && (copyRecordToMessage(record, message), true);
   }
 
   static bool isCurrentHeader(const StorageHeader& header)
@@ -728,6 +761,7 @@ private:
   static bool isValid(const DiskRecord& record)
   {
     return record.magic == RECORD_MAGIC && record.id != 0 &&
+           record.priority <= static_cast<uint8_t>(Priority::Red) &&
            record.nameLength > 0 && record.nameLength <= MAX_NAME_LENGTH &&
            record.textLength > 0 && record.textLength <= MAX_MESSAGE_LENGTH &&
            record.checksum == checksum(record);
@@ -968,6 +1002,26 @@ private:
     return true;
   }
 
+  static bool parsePriority(const char* value, uint8_t& priority)
+  {
+    if (strcmp(value, "green") == 0)
+    {
+      priority = static_cast<uint8_t>(Priority::Green);
+      return true;
+    }
+    if (strcmp(value, "orange") == 0)
+    {
+      priority = static_cast<uint8_t>(Priority::Orange);
+      return true;
+    }
+    if (strcmp(value, "red") == 0)
+    {
+      priority = static_cast<uint8_t>(Priority::Red);
+      return true;
+    }
+    return false;
+  }
+
   static bool parseImport(File& source, File& replacement,
                           uint32_t& importedCount, uint32_t& highestId)
   {
@@ -1032,8 +1086,19 @@ private:
       reader.seek(reader.position() - 1);
       char text[MAX_MESSAGE_LENGTH + 1]{};
       if (!readString(reader, key, sizeof(key)) || strcmp(key, "text") != 0 ||
-        !expect(reader, ':') || !readString(reader, text, sizeof(text)) ||
-        !expect(reader, '}')) return false;
+        !expect(reader, ':') || !readString(reader, text, sizeof(text))) return false;
+
+      uint8_t priority = static_cast<uint8_t>(Priority::Green);
+      if (!nextNonWhitespace(reader, next)) return false;
+      if (next != '}')
+      {
+        if (next != ',' || !expect(reader, '"')) return false;
+        reader.seek(reader.position() - 1);
+        char priorityValue[8]{};
+        if (!readString(reader, key, sizeof(key)) || strcmp(key, "priority") != 0 ||
+            !expect(reader, ':') || !readString(reader, priorityValue, sizeof(priorityValue)) ||
+            !parsePriority(priorityValue, priority) || !expect(reader, '}')) return false;
+      }
 
       int64_t epoch = 0;
       if (!parseTimestamp(timestamp, epoch)) return false;
@@ -1041,6 +1106,7 @@ private:
       record.magic = RECORD_MAGIC;
       record.id = id;
       record.createdAtEpoch = epoch;
+      record.priority = priority;
       record.nameLength = static_cast<uint8_t>(strlen(name));
       record.textLength = static_cast<uint16_t>(strlen(text));
       if (record.nameLength == 0 || record.textLength == 0)
@@ -1050,12 +1116,17 @@ private:
       memcpy(record.name, name, record.nameLength);
       memcpy(record.text, text, record.textLength);
       record.checksum = checksum(record);
-      if (!writer.write(reinterpret_cast<const uint8_t*>(&record), sizeof(record)))
+      const bool keepRecord = importedCount < MAX_IMPORTED_MESSAGES;
+      if (keepRecord &&
+          !writer.write(reinterpret_cast<const uint8_t*>(&record), sizeof(record)))
       {
         return false;
       }
-      ++importedCount;
       highestId = id > highestId ? id : highestId;
+      if (keepRecord)
+      {
+        ++importedCount;
+      }
       if ((importedCount & 0x1f) == 0)
       {
         esp_task_wdt_reset();
@@ -1068,7 +1139,8 @@ private:
     }
   }
 
-  bool rewrite(uint32_t targetId, const char* name, const char* text, bool removeMessage)
+  bool rewrite(uint32_t targetId, const char* name, const char* text,
+               Priority priority, bool removeMessage)
   {
     if (!ready() || targetId == 0 || (!removeMessage && (name == nullptr || text == nullptr)) ||
         xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
@@ -1125,6 +1197,7 @@ private:
         found = true;
         if (!removeMessage)
         {
+          record.priority = static_cast<uint8_t>(priority);
           record.nameLength = static_cast<uint8_t>(nameLength);
           record.textLength = static_cast<uint16_t>(textLength);
           memset(record.name, 0, sizeof(record.name));
@@ -1221,4 +1294,5 @@ private:
   uint32_t nextId_ = 1;
   uint32_t messageCount_ = 0;
   bool importInProgress_ = false;
+  const char* importError_ = "none";
 };

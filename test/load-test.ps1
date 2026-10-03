@@ -1,87 +1,76 @@
 $ErrorActionPreference = 'Stop'
 
 # Edit these values only when the test setup itself should change.
-$BaseUri = 'http://192.168.1.110'
+$BaseUri = 'http://192.168.1.102'
 $MaxClients = 300
-$StageSeconds = 30
+$StageSeconds = 120
 $ConnectTimeoutSeconds = 15
 $StartupDelayMs = 100
 $MessageIntervalSeconds = 10
+$PollIntervalSeconds = 20
+$PollJitterSeconds = 3
 
-$sseWorker = {
-  param($Uri, $ClientId, $Seconds, $ConnectTimeout)
+$pollWorker = {
+  param($Uri, $ClientId, $Seconds, $ConnectTimeout, $PollInterval, $PollJitter)
 
   Add-Type -AssemblyName System.Net.Http
   $client = [System.Net.Http.HttpClient]::new()
   $client.Timeout = [TimeSpan]::FromMilliseconds(-1)
-  $connectSource = [System.Threading.CancellationTokenSource]::new()
-  $connectSource.CancelAfter([TimeSpan]::FromSeconds($ConnectTimeout))
-  $source = [System.Threading.CancellationTokenSource]::new()
-  $source.CancelAfter([TimeSpan]::FromSeconds($Seconds))
-  $request = $null
-  $response = $null
-  $reader = $null
-  $connected = $false
-  $events = 0
+  $polls = 0
+  $messages = 0
+  $failures = 0
   $errorText = $null
+  $afterId = 0
+  $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
 
   try {
-    $request = [System.Net.Http.HttpRequestMessage]::new(
-      [System.Net.Http.HttpMethod]::Get,
-      "$Uri/api/events")
-    $request.Headers.Accept.Add(
-      [System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new('text/event-stream'))
-    $response = $client.SendAsync(
-      $request,
-      [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
-      $connectSource.Token).GetAwaiter().GetResult()
-
-    if (-not $response.IsSuccessStatusCode) {
-      throw "HTTP $([int]$response.StatusCode)"
-    }
-    $connected = $true
-
-    $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-    $reader = [System.IO.StreamReader]::new($stream)
-    $readTask = $reader.ReadLineAsync()
-    while (-not $source.IsCancellationRequested) {
-      if (-not $readTask.Wait(1000)) {
-        continue
+    while ([DateTime]::UtcNow -lt $deadline) {
+      $endpoint = if ($afterId -eq 0) {
+        "$Uri/api/messages?limit=50"
+      } else {
+        "$Uri/api/messages?after=$afterId&limit=50"
       }
-      $line = $readTask.GetAwaiter().GetResult()
-      if ($null -eq $line) {
-        break
+      $request = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Get, $endpoint)
+      $request.Headers.ConnectionClose = $true
+      $connectSource = [System.Threading.CancellationTokenSource]::new()
+      $connectSource.CancelAfter([TimeSpan]::FromSeconds($ConnectTimeout))
+      try {
+        $response = $client.SendAsync($request, $connectSource.Token).GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+          throw "HTTP $([int]$response.StatusCode)"
+        }
+        $data = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+        $polls++
+        $messages += @($data.p).Count
+        if (@($data.p).Count -gt 0) {
+          $afterId = [uint32](@($data.p)[0].i)
+        }
       }
-      if ($line.StartsWith('event:')) {
-        $events++
+      catch {
+        $failures++
+        $errorText = $_.Exception.Message
       }
-      $readTask = $reader.ReadLineAsync()
-    }
-  }
-  catch {
-    if ($connectSource.IsCancellationRequested -and -not $connected) {
-      $errorText = "connection timeout after $ConnectTimeout seconds"
-    } elseif (-not $source.IsCancellationRequested) {
-      $errorText = $_.Exception.Message
+      finally {
+        if ($response) { $response.Dispose(); $response = $null }
+        $request.Dispose()
+        $connectSource.Dispose()
+      }
+      $jitterMs = Get-Random -Minimum (-$PollJitter * 1000) -Maximum (($PollJitter * 1000) + 1)
+      $delayMs = [Math]::Max(1000, ($PollInterval * 1000) + $jitterMs)
+      Start-Sleep -Milliseconds $delayMs
     }
   }
   finally {
-    if (-not $connected -and -not $errorText) {
-      $errorText = 'connection failed'
-    }
-    if ($reader) { $reader.Dispose() }
-    if ($response) { $response.Dispose() }
-    if ($request) { $request.Dispose() }
-    $connectSource.Dispose()
-    $source.Dispose()
     $client.Dispose()
   }
 
   [pscustomobject]@{
-    Type = 'SSE'
+    Type = 'POLL'
     Id = $ClientId
-    Connected = $connected
-    Events = $events
+    Polls = $polls
+    Messages = $messages
+    Failures = $failures
     Error = $errorText
   }
 }
@@ -145,7 +134,8 @@ function Invoke-StressStage {
 
   try {
     for ($clientId = 1; $clientId -le $ClientCount; $clientId++) {
-      $jobs.Add((Start-Job -ScriptBlock $sseWorker -ArgumentList $BaseUri, $clientId, $workerSeconds, $ConnectTimeoutSeconds))
+      $jobs.Add((Start-Job -ScriptBlock $pollWorker -ArgumentList $BaseUri, $clientId,
+        $workerSeconds, $ConnectTimeoutSeconds, $PollIntervalSeconds, $PollJitterSeconds))
       if ($StartupDelayMs -gt 0 -and $clientId -lt $ClientCount) {
         Start-Sleep -Milliseconds $StartupDelayMs
       }
@@ -174,17 +164,18 @@ function Invoke-StressStage {
     }
   }
 
-  $sse = @($results | Where-Object Type -eq 'SSE')
+  $poll = @($results | Where-Object Type -eq 'POLL')
   $post = @($results | Where-Object Type -eq 'POST')
-  $connected = @($sse | Where-Object Connected).Count
+  $polls = [int](($poll | Measure-Object -Property Polls -Sum).Sum)
+  $pollFailures = [int](($poll | Measure-Object -Property Failures -Sum).Sum)
   $posted = [int](($post | Measure-Object -Property Posted -Sum).Sum)
   $failed = [int](($post | Measure-Object -Property Failed -Sum).Sum)
 
   [pscustomobject]@{
     Clients = $ClientCount
-    Connected = $connected
-    ConnectionFailures = $ClientCount - $connected
-    Events = [int](($sse | Measure-Object -Property Events -Sum).Sum)
+    Polls = $polls
+    PollFailures = $pollFailures
+    MessagesReceived = [int](($poll | Measure-Object -Property Messages -Sum).Sum)
     Posted = $posted
     WriteFailures = $failed
     RequiredWrites = $messageCount
@@ -207,7 +198,7 @@ function Test-StressStage {
   $result | Format-List
 
   [pscustomobject]@{
-    Passed = $result.ConnectionFailures -eq 0 -and
+    Passed = $result.PollFailures -eq 0 -and
       $result.Posted -ge $result.RequiredWrites -and
       $result.WriteFailures -eq 0
     Result = $result
@@ -242,8 +233,8 @@ while ($firstFailing -gt 0 -and $firstFailing - $lastPassing -gt 1) {
 }
 
 if ($firstFailing -eq 0) {
-  Write-Host "Maximum confirmed capacity: $lastPassing browser connections" -ForegroundColor Green
+  Write-Host "Maximum confirmed capacity: $lastPassing polling clients" -ForegroundColor Green
 } else {
-  Write-Host "Maximum confirmed capacity: $lastPassing browser connections" -ForegroundColor Green
-  Write-Host "First failed connection level: $firstFailing browser connections" -ForegroundColor Red
+  Write-Host "Maximum confirmed capacity: $lastPassing polling clients" -ForegroundColor Green
+  Write-Host "First failed polling level: $firstFailing clients" -ForegroundColor Red
 }

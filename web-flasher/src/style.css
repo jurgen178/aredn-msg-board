@@ -1,0 +1,30 @@
+:root {
+  color: #17221e;
+  background: #e6ede7;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+.shell { width: min(760px, calc(100% - 32px)); margin: 0 auto; padding: 56px 0; }
+header { padding: 8px 0 28px; }
+.eyebrow { margin: 0 0 14px; color: #b64a2b; font: 700 12px/1.2 Arial, sans-serif; letter-spacing: 0.14em; }
+h1 { max-width: 620px; margin: 0; color: #263c34; font-family: Consolas, "Cascadia Mono", "SFMono-Regular", monospace; font-size: clamp(28px, 8vw, 68px); line-height: 0.95; font-weight: 700; letter-spacing: 0; white-space: nowrap; }
+.intro { max-width: 540px; margin: 24px 0 0; color: #506158; font: 18px/1.5 Arial, sans-serif; }
+.panel { margin-top: 18px; padding: 24px; border: 1px solid #b9c9bd; background: #f5f8f3; }
+.file-picker { display: grid; gap: 10px; font: 700 15px/1.2 Arial, sans-serif; }
+input[type='file'] { width: 100%; padding: 14px; border: 1px dashed #839b89; background: #fff; font: 14px Arial, sans-serif; }
+select { width: 100%; padding: 14px; border: 1px solid #839b89; background: #fff; color: #17221e; font: 14px Arial, sans-serif; }
+.or-divider { margin: 20px 0; color: #839187; font: 12px/1.2 Arial, sans-serif; text-transform: uppercase; letter-spacing: 0.08em; }
+.actions { display: grid; gap: 14px; }
+button { width: 100%; padding: 16px 20px; border: 0; background: #b64a2b; color: white; cursor: pointer; font: 700 16px Arial, sans-serif; }
+button:disabled { background: #aebbb1; cursor: not-allowed; }
+progress { width: 100%; height: 12px; accent-color: #b64a2b; }
+.status { margin: 14px 0 0; color: #506158; font: 14px/1.45 Arial, sans-serif; }
+.details { display: grid; grid-template-columns: 130px 1fr; gap: 8px 16px; margin: 20px 0 0; font: 14px/1.4 Arial, sans-serif; }
+.details dt { color: #66766c; }
+.details dd { margin: 0; font-weight: 700; overflow-wrap: anywhere; }
+.log-panel h2 { margin: 0 0 12px; font: 700 14px Arial, sans-serif; text-transform: uppercase; letter-spacing: 0.08em; }
+pre { min-height: 90px; max-height: 240px; margin: 0; overflow: auto; color: #d8e5d8; background: #17221e; padding: 14px; white-space: pre-wrap; font: 12px/1.5 Consolas, monospace; }
+@media (max-width: 520px) { .shell { padding: 32px 0; } .panel { padding: 18px; } .details { grid-template-columns: 1fr; gap: 2px; } }

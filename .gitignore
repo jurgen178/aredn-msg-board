@@ -1,6 +1,6 @@
-﻿################################################################################
-# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
-################################################################################
-
-/.vs
+﻿/.vs
 /arduino_secrets.h
+/build/
+/web-flasher/dist/
+/web-flasher/node_modules/
+/web-flasher/releases/

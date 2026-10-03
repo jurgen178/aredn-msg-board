@@ -7,7 +7,6 @@
 #include <ctime>
 #include <cstdlib>
 #include <sys/time.h>
-#include <esp_sntp.h>
 #include <esp_system.h>
 #include "BoardPage.h"
 #include "FfatMessageBoard.h"
@@ -19,12 +18,15 @@ namespace
 constexpr char WIFI_SSID[] = SECRET_SSID;
 constexpr char WIFI_PASSWORD[] = SECRET_PASS;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
-constexpr uint32_t NTP_SYNC_INTERVAL_MS = 15UL * 60UL * 1000UL;
 constexpr int64_t MIN_VALID_EPOCH = 1577836800LL;
+constexpr int64_t CLIENT_TIME_BOOTSTRAP_EPOCH = 1700000000LL;
 constexpr int64_t MAX_VALID_EPOCH = 4102444800LL;
 constexpr uint8_t TIME_SOURCE_UNSET = 0;
 constexpr uint8_t TIME_SOURCE_NETWORK = 1;
 constexpr uint8_t TIME_SOURCE_MANUAL = 2;
+constexpr uint8_t TIME_SOURCE_CLIENT = 3;
+constexpr uint8_t CLIENT_TIME_AGREEMENT_COUNT = 3;
+constexpr int64_t CLIENT_TIME_MAX_SAMPLE_SPREAD = 10;
 constexpr char ADMIN_PASSWORD[] = "aredn-admin";
 constexpr uint32_t SERIAL_STATUS_INTERVAL_MS = 15000;
 constexpr uint8_t OLED_WIDTH = 128;
@@ -34,16 +36,19 @@ constexpr uint8_t OLED_ADDRESS = 0x3C;
 constexpr uint32_t OLED_PAGE_INTERVAL_MS = 5000;
 
 AsyncWebServer server(80);
-AsyncEventSource events("/api/events");
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
 FfatMessageBoard messageBoard;
 std::atomic<uint8_t> deviceTimeSource{TIME_SOURCE_UNSET};
 std::atomic<uint32_t> adminSessionToken{0};
 std::atomic<uint32_t> boardRevision{1};
+std::atomic<uint32_t> fullRefreshRevision{0};
 std::atomic<bool> importUploadActive{false};
+SemaphoreHandle_t clientTimeMutex = nullptr;
+int64_t clientTimeSamples[CLIENT_TIME_AGREEMENT_COUNT]{};
+uint32_t clientTimeSampleClients[CLIENT_TIME_AGREEMENT_COUNT]{};
+uint8_t clientTimeSampleCount = 0;
 uint32_t lastReconnectAttempt = 0;
 bool wasConnected = false;
-uint32_t lastEventHeartbeat = 0;
 uint32_t lastSerialStatus = 0;
 uint32_t lastDisplayUpdate = 0;
 uint32_t displayedBoardRevision = 0;
@@ -100,6 +105,67 @@ void printDisplayUtf8(const char* value)
   }
 }
 
+void printDisplayUtf8Ellipsis(const char* value, uint8_t maxCharacters)
+{
+  const uint8_t* current = reinterpret_cast<const uint8_t*>(value);
+  uint8_t characterCount = 0;
+  while (*current != '\0')
+  {
+    uint8_t sequenceLength = 1;
+    if (*current >= 0xC2 && *current <= 0xDF)
+    {
+      sequenceLength = 2;
+    }
+    else if (*current >= 0xE0 && *current <= 0xEF)
+    {
+      sequenceLength = 3;
+    }
+    else if (*current >= 0xF0 && *current <= 0xF4)
+    {
+      sequenceLength = 4;
+    }
+    current += sequenceLength;
+    ++characterCount;
+  }
+
+  if (characterCount <= maxCharacters)
+  {
+    printDisplayUtf8(value);
+    return;
+  }
+
+  const uint8_t visibleCharacters = maxCharacters > 3 ? maxCharacters - 3 : 0;
+  current = reinterpret_cast<const uint8_t*>(value);
+  for (uint8_t index = 0; index < visibleCharacters && *current != '\0'; ++index)
+  {
+    if (*current < 0x80)
+    {
+      display.write(*current++);
+      continue;
+    }
+
+    uint8_t sequenceLength = 1;
+    if (*current >= 0xC2 && *current <= 0xDF)
+    {
+      sequenceLength = 2;
+    }
+    else if (*current >= 0xE0 && *current <= 0xEF)
+    {
+      sequenceLength = 3;
+    }
+    else if (*current >= 0xF0 && *current <= 0xF4)
+    {
+      sequenceLength = 4;
+    }
+    display.write('?');
+    current += sequenceLength;
+  }
+  display.print("...");
+}
+
+void formatSerialClock(char* output, size_t outputSize);
+const char* messagePriorityName(uint8_t priority);
+
 void refreshLatestDisplayMessage()
 {
   latestMessageAvailable = messageBoard.readLatest(latestMessage);
@@ -124,16 +190,29 @@ void drawBoardDisplay()
         ? WiFi.localIP().toString().c_str()
         : "DISCONNECTED");
     char metrics[22];
+    formatSerialClock(metrics, sizeof(metrics));
+    drawDisplayLine(2, "Time: ", metrics);
     snprintf(metrics, sizeof(metrics), "%lu", static_cast<unsigned long>(messageBoard.messageCount()));
     drawDisplayLine(3, "Messages: ", metrics);
-    snprintf(metrics, sizeof(metrics), "%lu", static_cast<unsigned long>(messageBoard.pending()));
-    drawDisplayLine(4, "Pending: ", metrics);
     snprintf(metrics, sizeof(metrics), "%d dBm",
              WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
-    drawDisplayLine(5, "WiFi: ", metrics);
+    drawDisplayLine(4, "WiFi: ", metrics);
     snprintf(metrics, sizeof(metrics), "%lu KB",
              static_cast<unsigned long>(ESP.getFreeHeap() / 1024));
-    drawDisplayLine(6, "Heap: ", metrics);
+    drawDisplayLine(5, "Heap: ", metrics);
+    const uint32_t storageTotal = messageBoard.totalBytes();
+    const uint32_t storagePercent = storageTotal == 0
+      ? 0
+      : static_cast<uint32_t>(static_cast<uint64_t>(messageBoard.usedBytes()) * 100 / storageTotal);
+    snprintf(metrics, sizeof(metrics), "%lu%%",
+         static_cast<unsigned long>(storagePercent));
+    drawDisplayLine(6, "Storage: ", metrics);
+    const uint32_t uptimeSeconds = millis() / 1000;
+        snprintf(metrics, sizeof(metrics), "%lud %02luh %02lum",
+         static_cast<unsigned long>(uptimeSeconds / 86400),
+         static_cast<unsigned long>((uptimeSeconds / 3600) % 24),
+          static_cast<unsigned long>((uptimeSeconds / 60) % 60));
+        drawDisplayLine(7, "Uptime: ", metrics);
   }
   else
   {
@@ -147,9 +226,16 @@ void drawBoardDisplay()
     }
     else
     {
-      display.println("LAST MESSAGE");
+      display.print("LAST MESSAGE");
+      if (latestMessage.priority != static_cast<uint8_t>(FfatMessageBoard::Priority::Green))
+      {
+        display.print(" [");
+        display.print(messagePriorityName(latestMessage.priority));
+        display.print("]");
+      }
+      display.println();
       display.setCursor(0, 16);
-      printDisplayUtf8(latestMessage.name);
+      printDisplayUtf8Ellipsis(latestMessage.name, 21);
       display.println();
       display.setCursor(0, 28);
       printDisplayUtf8(latestMessage.text);
@@ -163,22 +249,38 @@ void drawBoardDisplay()
 void initializeDisplay()
 {
   Wire.begin();
+  Serial.println("I2C initialized");
+
+  Serial.println("Scanning I2C bus...");
   Wire.beginTransmission(OLED_ADDRESS);
-  if (Wire.endTransmission() != 0 ||
-      !display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS))
+  const uint8_t error = Wire.endTransmission();
+
+  if (error != 0)
   {
-    Serial.printf("OLED unavailable at address 0x%02X\n", OLED_ADDRESS);
+    displayAvailable = false;
+    Serial.printf("No I2C device at address 0x%02X (error: %u)\n", OLED_ADDRESS, error);
+    Serial.println("Service continues without display.");
+    return;
+  }
+
+  Serial.printf("I2C device found at address 0x%02X\n", OLED_ADDRESS);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS))
+  {
+    displayAvailable = false;
+    Serial.println("Display found via I2C but initialization failed.");
+    Serial.println("Service continues without display.");
     return;
   }
 
   displayAvailable = true;
+  Serial.println("Display successfully initialized");
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println("AREDN MESSAGE BOARD");
   display.println();
-  display.println("STARTING SERVICE...");
+  display.println("STARTING SERVICE ...");
   display.display();
 }
 
@@ -209,15 +311,6 @@ bool containsSearchTerm(const char* value, const String& searchTerm)
   return false;
 }
 
-void sendBoardEvent(const char* eventName, uint32_t messageId = 0)
-{
-  char payload[96];
-  snprintf(payload, sizeof(payload), "{\"revision\":%lu,\"message_id\":%lu}",
-           static_cast<unsigned long>(boardRevision.load(std::memory_order_acquire)),
-           static_cast<unsigned long>(messageId));
-  events.send(payload, eventName, millis());
-}
-
 bool isDeviceTimeValid()
 {
   return static_cast<int64_t>(time(nullptr)) >= MIN_VALID_EPOCH;
@@ -230,17 +323,127 @@ const char* deviceTimeSourceName()
     return "unset";
   }
 
-  return deviceTimeSource.load(std::memory_order_acquire) == TIME_SOURCE_MANUAL
-      ? "manual"
-      : "network";
+  switch (deviceTimeSource.load(std::memory_order_acquire))
+  {
+    case TIME_SOURCE_MANUAL: return "manual";
+    case TIME_SOURCE_CLIENT: return "client";
+    default: return "unset";
+  }
 }
 
-void onNetworkTimeSync(struct timeval* syncedTime)
+void resetClientTimeSamples()
 {
-  if (syncedTime != nullptr && static_cast<int64_t>(syncedTime->tv_sec) >= MIN_VALID_EPOCH)
+  clientTimeSampleCount = 0;
+}
+
+bool addClientTimeSample(int64_t epoch, uint32_t clientAddress)
+{
+  for (uint8_t index = 0; index < clientTimeSampleCount; ++index)
   {
-    deviceTimeSource.store(TIME_SOURCE_NETWORK, std::memory_order_release);
+    if (clientTimeSampleClients[index] == clientAddress)
+    {
+      return false;
+    }
   }
+
+  if (clientTimeSampleCount < CLIENT_TIME_AGREEMENT_COUNT)
+  {
+    clientTimeSamples[clientTimeSampleCount] = epoch;
+    clientTimeSampleClients[clientTimeSampleCount++] = clientAddress;
+  }
+  else
+  {
+    for (uint8_t index = 1; index < CLIENT_TIME_AGREEMENT_COUNT; ++index)
+    {
+      clientTimeSamples[index - 1] = clientTimeSamples[index];
+      clientTimeSampleClients[index - 1] = clientTimeSampleClients[index];
+    }
+    clientTimeSamples[CLIENT_TIME_AGREEMENT_COUNT - 1] = epoch;
+    clientTimeSampleClients[CLIENT_TIME_AGREEMENT_COUNT - 1] = clientAddress;
+  }
+  return true;
+}
+
+void synchronizeFromClient(int64_t clientEpoch, uint32_t clientAddress)
+{
+  if (clientTimeMutex == nullptr || clientEpoch < CLIENT_TIME_BOOTSTRAP_EPOCH ||
+      clientEpoch > MAX_VALID_EPOCH ||
+      xSemaphoreTake(clientTimeMutex, portMAX_DELAY) != pdTRUE)
+  {
+    return;
+  }
+
+  const bool manualTime = deviceTimeSource.load(std::memory_order_acquire) == TIME_SOURCE_MANUAL;
+  const int64_t deviceEpoch = static_cast<int64_t>(time(nullptr));
+  const struct timeval clientTime = {static_cast<time_t>(clientEpoch), 0};
+  if (deviceEpoch < CLIENT_TIME_BOOTSTRAP_EPOCH ||
+      deviceTimeSource.load(std::memory_order_acquire) == TIME_SOURCE_UNSET)
+  {
+    if (settimeofday(&clientTime, nullptr) == 0)
+    {
+      deviceTimeSource.store(TIME_SOURCE_CLIENT, std::memory_order_release);
+      resetClientTimeSamples();
+    }
+    xSemaphoreGive(clientTimeMutex);
+    return;
+  }
+
+  const int64_t difference = clientEpoch > deviceEpoch
+      ? clientEpoch - deviceEpoch
+      : deviceEpoch - clientEpoch;
+  if (!manualTime && difference >= 1 && difference <= CLIENT_TIME_MAX_SAMPLE_SPREAD)
+  {
+    if (settimeofday(&clientTime, nullptr) == 0)
+    {
+      deviceTimeSource.store(TIME_SOURCE_CLIENT, std::memory_order_release);
+      resetClientTimeSamples();
+    }
+    xSemaphoreGive(clientTimeMutex);
+    return;
+  }
+
+  if (manualTime || difference > CLIENT_TIME_MAX_SAMPLE_SPREAD)
+  {
+    if (!addClientTimeSample(clientEpoch, clientAddress))
+    {
+      xSemaphoreGive(clientTimeMutex);
+      return;
+    }
+    if (clientTimeSampleCount == CLIENT_TIME_AGREEMENT_COUNT)
+    {
+      int64_t lowest = clientTimeSamples[0];
+      int64_t highest = clientTimeSamples[0];
+      for (uint8_t index = 1; index < CLIENT_TIME_AGREEMENT_COUNT; ++index)
+      {
+        lowest = min(lowest, clientTimeSamples[index]);
+        highest = max(highest, clientTimeSamples[index]);
+      }
+      if (highest - lowest <= CLIENT_TIME_MAX_SAMPLE_SPREAD)
+      {
+        int64_t median = clientTimeSamples[0];
+        for (uint8_t index = 0; index < CLIENT_TIME_AGREEMENT_COUNT; ++index)
+        {
+          uint8_t valuesBelow = 0;
+          for (uint8_t candidate = 0; candidate < CLIENT_TIME_AGREEMENT_COUNT; ++candidate)
+          {
+            valuesBelow += clientTimeSamples[candidate] < clientTimeSamples[index] ? 1 : 0;
+          }
+          if (valuesBelow == CLIENT_TIME_AGREEMENT_COUNT / 2)
+          {
+            median = clientTimeSamples[index];
+            break;
+          }
+        }
+        const struct timeval consensusTime = {static_cast<time_t>(median), 0};
+        if (settimeofday(&consensusTime, nullptr) == 0)
+        {
+          deviceTimeSource.store(TIME_SOURCE_CLIENT, std::memory_order_release);
+        }
+        resetClientTimeSamples();
+      }
+    }
+  }
+  xSemaphoreGive(clientTimeMutex);
 }
 
 void appendJsonString(Print& output, const char* value)
@@ -291,6 +494,36 @@ void appendIsoTimestamp(Print& output, int64_t epoch)
   appendJsonString(output, formatted);
 }
 
+const char* messagePriorityName(uint8_t priority)
+{
+  switch (static_cast<FfatMessageBoard::Priority>(priority))
+  {
+    case FfatMessageBoard::Priority::Orange: return "orange";
+    case FfatMessageBoard::Priority::Red: return "red";
+    default: return "green";
+  }
+}
+
+bool parseMessagePriority(const String& value, FfatMessageBoard::Priority& priority)
+{
+  if (value == "green")
+  {
+    priority = FfatMessageBoard::Priority::Green;
+    return true;
+  }
+  if (value == "orange")
+  {
+    priority = FfatMessageBoard::Priority::Orange;
+    return true;
+  }
+  if (value == "red")
+  {
+    priority = FfatMessageBoard::Priority::Red;
+    return true;
+  }
+  return false;
+}
+
 void formatSerialClock(char* output, size_t outputSize)
 {
   if (!isDeviceTimeValid())
@@ -336,7 +569,8 @@ void writeMessageItems(AsyncResponseStream& response,
                        uint32_t beforeId = 0,
                        uint32_t afterId = 0,
                        bool* hasMore = nullptr,
-                       const String* searchTerm = nullptr)
+                       const String* searchTerm = nullptr,
+                       int priorityFilter = -1)
 {
   if (hasMore != nullptr)
   {
@@ -361,12 +595,11 @@ void writeMessageItems(AsyncResponseStream& response,
       break;
     }
     FfatMessageBoard::Message message{};
-    const bool readable = sequentialSearch
-        ? messageBoard.readNext(file, message)
-        : messageBoard.readAtExclusive(file, index, message);
+    const bool readable = messageBoard.readAtExclusive(file, index, message);
     if (!readable ||
         (beforeId != 0 && message.id >= beforeId) ||
         (afterId != 0 && message.id <= afterId) ||
+        (priorityFilter >= 0 && message.priority != static_cast<uint8_t>(priorityFilter)) ||
         (searchTerm != nullptr &&
          !containsSearchTerm(message.name, *searchTerm) &&
          !containsSearchTerm(message.text, *searchTerm)))
@@ -399,17 +632,23 @@ void writeMessageItems(AsyncResponseStream& response,
       appendJsonString(response, message.name);
       response.print(",\n      \"text\": ");
       appendJsonString(response, message.text);
+      if (message.priority != static_cast<uint8_t>(FfatMessageBoard::Priority::Green))
+      {
+        response.print(",\n      \"priority\": ");
+        appendJsonString(response, messagePriorityName(message.priority));
+      }
       response.print("\n    }");
     }
     else
     {
-      response.printf("{\"id\":%lu,\"created_at\":",
-                      static_cast<unsigned long>(message.id));
-      appendIsoTimestamp(response, message.createdAtEpoch);
-      response.print(",\"name\":");
+      response.printf("{\"i\":%lu,\"t\":%lld,\"u\":",
+                      static_cast<unsigned long>(message.id),
+                      static_cast<long long>(message.createdAtEpoch));
       appendJsonString(response, message.name);
-      response.print(",\"text\":");
+      response.print(",\"m\":");
       appendJsonString(response, message.text);
+      response.print(",\"p\":");
+      appendJsonString(response, messagePriorityName(message.priority));
       response.write('}');
     }
     ++count;
@@ -418,6 +657,20 @@ void writeMessageItems(AsyncResponseStream& response,
 
 void handleSubmitMessage(AsyncWebServerRequest* request)
 {
+  if (request->hasParam("c_time", true))
+  {
+    const String clientTimeValue = request->getParam("c_time", true)->value();
+    char* parseEnd = nullptr;
+    const long long clientEpoch = strtoll(clientTimeValue.c_str(), &parseEnd, 10);
+    if (parseEnd != clientTimeValue.c_str() && *parseEnd == '\0')
+    {
+      const uint32_t clientAddress = request->client() == nullptr
+          ? 0
+          : static_cast<uint32_t>(request->client()->remoteIP());
+      synchronizeFromClient(static_cast<int64_t>(clientEpoch), clientAddress);
+    }
+  }
+
   if (!request->hasParam("name", true) || !request->hasParam("text", true))
   {
     request->send(400, "application/json", "{\"error\":\"missing_fields\"}");
@@ -426,6 +679,13 @@ void handleSubmitMessage(AsyncWebServerRequest* request)
 
   String author = request->getParam("name", true)->value();
   String text = request->getParam("text", true)->value();
+  FfatMessageBoard::Priority priority = FfatMessageBoard::Priority::Green;
+  if (request->hasParam("priority", true) &&
+      !parseMessagePriority(request->getParam("priority", true)->value(), priority))
+  {
+    request->send(400, "application/json", "{\"error\":\"invalid_priority\"}");
+    return;
+  }
   author.trim();
   text.trim();
 
@@ -450,10 +710,15 @@ void handleSubmitMessage(AsyncWebServerRequest* request)
 
   uint32_t messageId = 0;
   const FfatMessageBoard::SubmitResult result = messageBoard.enqueue(
-      author.c_str(), text.c_str(), static_cast<int64_t>(time(nullptr)), messageId);
+      author.c_str(), text.c_str(), static_cast<int64_t>(time(nullptr)), priority, messageId);
   if (result == FfatMessageBoard::SubmitResult::Invalid)
   {
     request->send(400, "application/json", "{\"error\":\"invalid_message\"}");
+    return;
+  }
+  if (result == FfatMessageBoard::SubmitResult::Full)
+  {
+    request->send(409, "application/json", "{\"error\":\"board_full\"}");
     return;
   }
   if (result != FfatMessageBoard::SubmitResult::Accepted)
@@ -463,7 +728,6 @@ void handleSubmitMessage(AsyncWebServerRequest* request)
   }
 
   boardRevision.fetch_add(1, std::memory_order_acq_rel);
-  sendBoardEvent("message_changed", messageId);
 
   char responseBody[48];
   snprintf(responseBody, sizeof(responseBody), "{\"accepted\":true,\"id\":%lu}",
@@ -475,7 +739,11 @@ void registerRoutes()
 {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request)
   {
-    request->send_P(200, "text/html; charset=utf-8", BOARD_PAGE);
+    AsyncWebServerResponse* response = request->beginResponse_P(
+        200, "text/html; charset=utf-8", BOARD_PAGE);
+    response->addHeader("Cache-Control", "no-cache, must-revalidate");
+    response->addHeader("Connection", "close");
+    request->send(response);
   });
 
   server.on("/api/messages/export.json", HTTP_GET, [](AsyncWebServerRequest* request)
@@ -516,7 +784,7 @@ void registerRoutes()
     AsyncWebServerResponse* response = request->beginResponse(
         200, "application/json", "{\"authenticated\":true}");
     response->addHeader("Set-Cookie", "aredn_admin=" + String(token, HEX) +
-        "; Max-Age=3600; HttpOnly; SameSite=Strict");
+      "; Path=/; Max-Age=3600; HttpOnly; SameSite=Strict");
     request->send(response);
   });
 
@@ -553,13 +821,20 @@ void registerRoutes()
       return;
     }
     const bool failed = state == nullptr || state->failed;
+    const char* importError = messageBoard.importError();
     request->_tempObject = nullptr;
     delete state;
-    request->send(failed ? 400 : 200,
-                  "application/json",
-                    failed
-                      ? "{\"error\":\"import_failed\"}"
-                      : "{\"imported\":true}");
+    if (failed)
+    {
+      String response = "{\"error\":\"import_failed\",\"reason\":\"";
+      response += importError;
+      response += "\"}";
+      request->send(400, "application/json", response);
+    }
+    else
+    {
+      request->send(200, "application/json", "{\"imported\":true}");
+    }
   }, nullptr, [](AsyncWebServerRequest* request, uint8_t* data,
                  size_t length, size_t index, size_t total)
   {
@@ -606,8 +881,8 @@ void registerRoutes()
         importUploadActive.store(false, std::memory_order_release);
         if (!state->failed)
         {
-          boardRevision.fetch_add(1, std::memory_order_acq_rel);
-          sendBoardEvent("board_changed");
+          const uint32_t revision = boardRevision.fetch_add(1, std::memory_order_acq_rel) + 1;
+          fullRefreshRevision.store(revision, std::memory_order_release);
         }
       }
     }
@@ -623,8 +898,8 @@ void registerRoutes()
     const bool reset = messageBoard.reset();
     if (reset)
     {
-      boardRevision.fetch_add(1, std::memory_order_acq_rel);
-      sendBoardEvent("board_changed");
+      const uint32_t revision = boardRevision.fetch_add(1, std::memory_order_acq_rel) + 1;
+      fullRefreshRevision.store(revision, std::memory_order_release);
     }
     request->send(reset ? 200 : 500,
                   "application/json",
@@ -647,8 +922,8 @@ void registerRoutes()
     const bool deleted = messageBoard.remove(id);
     if (deleted)
     {
-      boardRevision.fetch_add(1, std::memory_order_acq_rel);
-      sendBoardEvent("board_changed");
+      const uint32_t revision = boardRevision.fetch_add(1, std::memory_order_acq_rel) + 1;
+      fullRefreshRevision.store(revision, std::memory_order_release);
     }
     request->send(deleted ? 200 : 404,
                   "application/json",
@@ -674,6 +949,13 @@ void registerRoutes()
     }
     String name = request->getParam("name", true)->value();
     String text = request->getParam("text", true)->value();
+    FfatMessageBoard::Priority priority = FfatMessageBoard::Priority::Green;
+    if (request->hasParam("priority", true) &&
+        !parseMessagePriority(request->getParam("priority", true)->value(), priority))
+    {
+      request->send(400, "application/json", "{\"error\":\"invalid_priority\"}");
+      return;
+    }
     name.trim();
     text.trim();
     const uint32_t id = request->getParam("id")->value().toInt();
@@ -684,11 +966,11 @@ void registerRoutes()
       request->send(400, "application/json", "{\"error\":\"invalid_message\"}");
       return;
     }
-    const bool updated = messageBoard.update(id, name.c_str(), text.c_str());
+    const bool updated = messageBoard.update(id, name.c_str(), text.c_str(), priority);
     if (updated)
     {
-      boardRevision.fetch_add(1, std::memory_order_acq_rel);
-      sendBoardEvent("board_changed");
+      const uint32_t revision = boardRevision.fetch_add(1, std::memory_order_acq_rel) + 1;
+      fullRefreshRevision.store(revision, std::memory_order_release);
     }
     request->send(updated ? 200 : 404,
                   "application/json",
@@ -699,6 +981,20 @@ void registerRoutes()
 
   server.on("/api/messages", HTTP_GET, [](AsyncWebServerRequest* request)
   {
+    if (request->hasParam("c_time"))
+    {
+      const String clientTimeValue = request->getParam("c_time")->value();
+      char* parseEnd = nullptr;
+      const long long clientEpoch = strtoll(clientTimeValue.c_str(), &parseEnd, 10);
+      if (parseEnd != clientTimeValue.c_str() && *parseEnd == '\0')
+      {
+        const uint32_t clientAddress = request->client() == nullptr
+            ? 0
+            : static_cast<uint32_t>(request->client()->remoteIP());
+        synchronizeFromClient(static_cast<int64_t>(clientEpoch), clientAddress);
+      }
+    }
+
     File file;
     if (!messageBoard.openReaderExclusive(file))
     {
@@ -708,7 +1004,7 @@ void registerRoutes()
 
     const bool clockValid = isDeviceTimeValid();
     const time_t currentEpoch = clockValid ? time(nullptr) : 0;
-    uint32_t limit = 50;
+    uint32_t limit = 20;
     if (request->hasParam("all"))
     {
       limit = 0;
@@ -716,7 +1012,7 @@ void registerRoutes()
     else if (request->hasParam("limit"))
     {
       const long requestedLimit = request->getParam("limit")->value().toInt();
-      limit = requestedLimit > 0 ? static_cast<uint32_t>(requestedLimit) : 50;
+      limit = requestedLimit > 0 ? static_cast<uint32_t>(requestedLimit) : 20;
       if (limit > 100)
       {
         limit = 100;
@@ -740,19 +1036,39 @@ void registerRoutes()
         return;
       }
     }
+    int priorityFilter = -1;
+    if (request->hasParam("priority"))
+    {
+      const String priorityValue = request->getParam("priority")->value();
+      if (priorityValue != "all" &&
+          (priorityValue == "green" || priorityValue == "orange" || priorityValue == "red"))
+      {
+        FfatMessageBoard::Priority parsedPriority;
+        parseMessagePriority(priorityValue, parsedPriority);
+        priorityFilter = static_cast<int>(parsedPriority);
+      }
+      else if (priorityValue != "all")
+      {
+        messageBoard.closeReaderExclusive(file);
+        request->send(400, "application/json", "{\"error\":\"invalid_priority\"}");
+        return;
+      }
+    }
     bool hasMore = false;
     AsyncResponseStream* response = request->beginResponseStream("application/json");
-    response->printf("{\"revision\":%lu,\"clock_valid\":%s,\"clock_source\":\"%s\",\"clock_epoch\":%lld,\"messages\":[",
-                     static_cast<unsigned long>(boardRevision.load(std::memory_order_acquire)),
+    const uint32_t currentRevision = boardRevision.load(std::memory_order_acquire);
+    const bool requiresFullRefresh = fullRefreshRevision.load(std::memory_order_acquire) == currentRevision;
+    response->printf("{\"r\":%lu,\"f\":%s,\"v\":%s,\"s\":\"%s\",\"e\":%lld,\"p\":[",
+             static_cast<unsigned long>(currentRevision),
+             requiresFullRefresh ? "true" : "false",
                      clockValid ? "true" : "false",
                      deviceTimeSourceName(),
                      static_cast<long long>(currentEpoch));
     uint32_t count = 0;
     writeMessageItems(*response, file, count, false, true, limit, beforeId, afterId, &hasMore,
-              searchTerm.isEmpty() ? nullptr : &searchTerm);
-    response->printf("],\"has_more\":%s,\"pending\":%lu,\"message_count\":%lu,\"used_bytes\":%lu,\"total_bytes\":%lu}",
+              searchTerm.isEmpty() ? nullptr : &searchTerm, priorityFilter);
+    response->printf("],\"h\":%s,\"c\":%lu,\"b\":%lu,\"z\":%lu}",
              hasMore ? "true" : "false",
-                     static_cast<unsigned long>(messageBoard.pending()),
                      static_cast<unsigned long>(messageBoard.messageCount()),
                      static_cast<unsigned long>(messageBoard.usedBytes()),
                      static_cast<unsigned long>(messageBoard.totalBytes()));
@@ -774,6 +1090,11 @@ void registerRoutes()
 
   server.on("/api/time", HTTP_POST, [](AsyncWebServerRequest* request)
   {
+    if (!isAdminAuthenticated(request))
+    {
+      sendAdminRequired(request);
+      return;
+    }
     if (!request->hasParam("epoch", true))
     {
       request->send(400, "application/json", "{\"error\":\"missing_epoch\"}");
@@ -790,14 +1111,24 @@ void registerRoutes()
       return;
     }
 
+    if (clientTimeMutex == nullptr ||
+        xSemaphoreTake(clientTimeMutex, portMAX_DELAY) != pdTRUE)
+    {
+      request->send(503, "application/json", "{\"error\":\"clock_busy\"}");
+      return;
+    }
+
     const struct timeval manualTime = {static_cast<time_t>(parsedEpoch), 0};
     if (settimeofday(&manualTime, nullptr) != 0)
     {
+      xSemaphoreGive(clientTimeMutex);
       request->send(500, "application/json", "{\"error\":\"clock_update_failed\"}");
       return;
     }
 
+    resetClientTimeSamples();
     deviceTimeSource.store(TIME_SOURCE_MANUAL, std::memory_order_release);
+    xSemaphoreGive(clientTimeMutex);
     request->send(200, "application/json", "{\"valid\":true,\"source\":\"manual\"}");
   });
 
@@ -808,23 +1139,27 @@ void registerRoutes()
     const bool connected = WiFi.status() == WL_CONNECTED;
     const String ipAddress = connected ? WiFi.localIP().toString() : "0.0.0.0";
     const int rssi = connected ? WiFi.RSSI() : 0;
-    char response[320];
+    char response[480];
 
     snprintf(
         response,
         sizeof(response),
       "{\"service\":\"aredn-service\",\"status\":\"ok\","
-      "\"queue_mode\":\"ffat\",\"queue_persistent\":true,"
         "\"board_ready\":%s,"
-        "\"queue_pending\":%lu,\"message_count\":%lu,"
+        "\"message_count\":%lu,"
         "\"storage_used_bytes\":%lu,\"storage_total_bytes\":%lu,"
+        "\"storage_free_bytes\":%lu,\"record_size_bytes\":%lu,"
+        "\"index_capacity\":%lu,\"index_bytes\":%lu,"
         "\"uptime_ms\":%lu,\"free_heap\":%lu,\"wifi_connected\":%s,"
         "\"ip\":\"%s\",\"rssi_dbm\":%d}",
       messageBoard.ready() ? "true" : "false",
-      static_cast<unsigned long>(messageBoard.pending()),
       static_cast<unsigned long>(messageBoard.messageCount()),
       static_cast<unsigned long>(messageBoard.usedBytes()),
       static_cast<unsigned long>(messageBoard.totalBytes()),
+      static_cast<unsigned long>(messageBoard.freeBytes()),
+      static_cast<unsigned long>(messageBoard.recordSize()),
+      static_cast<unsigned long>(messageBoard.indexCapacity()),
+      static_cast<unsigned long>(messageBoard.indexBytes()),
         static_cast<unsigned long>(millis()),
         static_cast<unsigned long>(ESP.getFreeHeap()),
         connected ? "true" : "false",
@@ -837,14 +1172,6 @@ void registerRoutes()
   {
     request->send(404, "text/plain; charset=utf-8", "Not found");
   });
-  events.onConnect([](AsyncEventSourceClient* client)
-  {
-    char payload[64];
-    snprintf(payload, sizeof(payload), "{\"revision\":%lu}",
-             static_cast<unsigned long>(boardRevision.load(std::memory_order_acquire)));
-    client->send(payload, "sync", millis());
-  });
-  server.addHandler(&events);
 }
 }
 
@@ -865,7 +1192,23 @@ void setup()
   Serial.println(" ms.]");
 
   Serial.println("\nAREDN service starting");
-  Serial.printf("ESP reset reason: %d\n", static_cast<int>(esp_reset_reason()));
+
+  Serial.printf("ESP reset reason: ");
+  esp_reset_reason_t r = esp_reset_reason();
+  switch(r) {
+    case ESP_RST_UNKNOWN:   Serial.printf("UNKNOWN (Reset reason can not be determined)"); break;
+    case ESP_RST_POWERON:   Serial.printf("Power-On"); break;
+    case ESP_RST_EXT:       Serial.printf("EXT_PIN (Reset by external pin)"); break;
+    case ESP_RST_SW:        Serial.printf("Software Reset"); break;
+    case ESP_RST_PANIC:     Serial.printf("❌ PANIC"); break;
+    case ESP_RST_INT_WDT:   Serial.printf("❌ Interrupt WDT"); break;
+    case ESP_RST_TASK_WDT:  Serial.printf("❌ Task WDT"); break;
+    case ESP_RST_WDT:       Serial.printf("❌ Other WDT"); break;
+    case ESP_RST_DEEPSLEEP: Serial.printf("Deep Sleep"); break;
+    case ESP_RST_BROWNOUT:  Serial.printf("❌ Brownout"); break;
+    case ESP_RST_SDIO:      Serial.printf("SDIO (Reset over SDIO)"); break;
+  }
+  Serial.printf(" (Code %d)\n", static_cast<int>(r));
   Serial.flush();
   initializeDisplay();
   Serial.printf("Hardware: %s | cores: %d | PSRAM: %lu KB | flash: %lu MB | free heap: %lu KB\n",
@@ -879,6 +1222,7 @@ void setup()
   {
     Serial.println("ERROR: Could not initialize the FFat message board");
   }
+  clientTimeMutex = xSemaphoreCreateMutex();
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -886,13 +1230,10 @@ void setup()
   Serial.printf("Wi-Fi setup: mode=STA | SSID=\"%s\" | sleep=off | auto-reconnect=on\n",
                 WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  sntp_set_time_sync_notification_cb(onNetworkTimeSync);
-  sntp_set_sync_interval(NTP_SYNC_INTERVAL_MS);
-  configTzTime("UTC0", "pool.ntp.org", "time.nist.gov");
-  Serial.println("SNTP time synchronization started; checking every 15 minutes");
+  Serial.println("Client time synchronization enabled");
   Serial.printf("Wi-Fi connection started (status %d)\n", static_cast<int>(WiFi.status()));
 
-  Serial.println("Waiting for AREDN WLAN connection...");
+  Serial.println("Waiting for AREDN WLAN connection ...");
   const uint32_t wifiWaitStart = millis();
   constexpr uint32_t WIFI_STARTUP_TIMEOUT_MS = 30000;
   while (WiFi.status() != WL_CONNECTED &&
@@ -902,6 +1243,7 @@ void setup()
   }
 
   registerRoutes();
+  DefaultHeaders::Instance().addHeader("Connection", "close");
   server.begin();
   Serial.println("Async HTTP server started on port 80");
   if (WiFi.status() != WL_CONNECTED)
@@ -909,31 +1251,21 @@ void setup()
     Serial.println("Wi-Fi not connected during startup; continuing with reconnect attempts");
     return;
   }
-  const String ipAddress = WiFi.localIP().toString();
-  const String gatewayAddress = WiFi.gatewayIP().toString();
-  const String subnetAddress = WiFi.subnetMask().toString();
-  const String dnsAddress = WiFi.dnsIP().toString();
-  Serial.printf("Wi-Fi connected: SSID=\"%s\" | IP=%s | gateway=%s | subnet=%s | DNS=%s | RSSI=%d dBm\n",
-                WIFI_SSID,
-                ipAddress.c_str(),
-                gatewayAddress.c_str(),
-                subnetAddress.c_str(),
-                dnsAddress.c_str(),
-                WiFi.RSSI());
-  Serial.printf("Web server: http://%s/\n", ipAddress.c_str());
+
+  Serial.printf("Wi-Fi connected: SSID=\"%s\" | gateway=%s | subnet=%s | DNS=%s | RSSI=%d dBm\n",
+              WIFI_SSID,
+              WiFi.gatewayIP().toString().c_str(),
+              WiFi.subnetMask().toString().c_str(),
+              WiFi.dnsIP().toString().c_str(),
+              WiFi.RSSI());
+
+  Serial.printf("Web server: http://%s/\n", WiFi.localIP().toString().c_str());
   wasConnected = true;
 }
 
 void loop()
 {
-  messageBoard.processPending();
-
   const uint32_t now = millis();
-  if (now - lastEventHeartbeat >= 15000)
-  {
-    lastEventHeartbeat = now;
-    events.send("", "heartbeat", now);
-  }
   const bool connected = WiFi.status() == WL_CONNECTED;
 
   if (displayAvailable)
@@ -961,13 +1293,12 @@ void loop()
     lastSerialStatus = now;
     char clockTime[14]{};
     formatSerialClock(clockTime, sizeof(clockTime));
-    Serial.printf("Status: time %s | heap %lu KB | Wi-Fi %s | RSSI %d dBm | messages %lu | pending %u\n",
+    Serial.printf("Status: time %s | heap %lu KB | Wi-Fi %s | RSSI %d dBm | messages %lu\n",
                   clockTime,
                   static_cast<unsigned long>(ESP.getFreeHeap() / 1024),
                   connected ? "connected" : "disconnected",
                   connected ? WiFi.RSSI() : 0,
-                  static_cast<unsigned long>(messageBoard.messageCount()),
-                  static_cast<unsigned int>(messageBoard.pending()));
+            static_cast<unsigned long>(messageBoard.messageCount()));
   }
  */
   if (connected && !wasConnected)
