@@ -1,5 +1,4 @@
 ﻿/.vs
-/arduino_secrets.h
 /build/
 /web-flasher/dist/
 /web-flasher/node_modules/
