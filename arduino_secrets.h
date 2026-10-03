@@ -1,0 +1,2 @@
+#define SECRET_SSID "AREDN-LAN"
+#define SECRET_PASS ""
