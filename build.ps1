@@ -1,6 +1,7 @@
+# This script automates the build and release process for the AREDN Message Board firmware.
 
 # https://arduino.github.io/arduino-cli/1.5/
-# arduino-cli core update-index
+# Run 'arduino-cli core update-index' before using this script for the first time.  
 #
 # WORKFLOW
 # 1. Change $Version below for a new firmware release.
@@ -11,15 +12,16 @@
 
 
 # --- CONFIGURATION ---
+$Version    = "1.0.0"
+
 # Path to the folder containing arduino-cli.exe (without a trailing backslash)
 $CliDir     = "C:\Arduino"
 $ArduinoCli = "$CliDir\arduino-cli.exe"
 $LibraryDir = "$CliDir\libraries"
 $BuildDir   = Join-Path $PSScriptRoot "build"
-$Version    = "1.0.0"
 $ReleaseRoot = Join-Path $PSScriptRoot "web-flasher\releases"
-$ReleaseDirectory = Join-Path $ReleaseRoot "aredn-v$Version"
-$ReleaseZip = Join-Path $ReleaseRoot "aredn-v$Version.zip"
+$ReleaseDirectory = Join-Path $ReleaseRoot "aredn-message-board-v$Version"
+$ReleaseZip = Join-Path $ReleaseRoot "aredn-message-board-v$Version.zip"
 $PublicReleaseDirectory = Join-Path $PSScriptRoot "web-flasher\public\releases"
 $WebFlasherDirectory = Join-Path $PSScriptRoot "web-flasher"
 
@@ -48,7 +50,13 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
 }
 
 # Board configuration
+# Get this data from the output of the following command:
 # arduino-cli board list
+# Look for the "FQBN" value for the board and the "Port" value for the connected device.
+# for example:
+#   Port  Protokoll Typ               Platinenname       FQBN                    Kern
+#   1-2.2 dfu       USB DFU           Arduino Nano ESP32 arduino:esp32:nano_nora arduino:esp32
+#   COM7  serial    Serial Port (USB) Arduino Nano ESP32 arduino:esp32:nano_nora arduino:esp32
 
 $Board = "arduino:esp32:nano_nora"
 $Port  = "COM7"
@@ -71,9 +79,7 @@ New-Item -ItemType Directory -Path $ReleaseDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $ReleaseRoot -Force | Out-Null
 
 $PackageFiles = @(
-    "$BuildDir\aredn-service.ino.bin",
-    "$BuildDir\aredn-service.ino.bootloader.bin",
-    "$BuildDir\aredn-service.ino.partitions.bin"
+    "$BuildDir\aredn-service.ino.bin"
 )
 foreach ($PackageFile in $PackageFiles) {
     if (-not (Test-Path $PackageFile)) {
@@ -107,8 +113,8 @@ if (Test-Path $ReleaseIndexPath) {
 }
 $ReleaseEntries += [ordered]@{
     version = $Version
-    label = "AREDN Service $Version"
-    url = "./releases/aredn-v$Version.zip"
+    label = "AREDN Message Board"
+    url = "./releases/aredn-message-board-v$Version.zip"
 }
 ConvertTo-Json -InputObject $ReleaseEntries -Depth 4 | Set-Content $ReleaseIndexPath
 Write-Host "Release created: $ReleaseZip" -ForegroundColor Green
@@ -136,8 +142,8 @@ if ($WebBuildExitCode -ne 0) {
 }
 
 Write-Host "`n[5/5] Board upload" -ForegroundColor Cyan
-$UploadChoice = Read-Host "Upload firmware to board on $Port? [Y/N]"
-if ($UploadChoice -match '^(Y|y|Yes|yes)$') {
+$UploadChoice = Read-Host "Upload firmware to board on $Port? [Y/n]"
+if ([string]::IsNullOrWhiteSpace($UploadChoice) -or $UploadChoice -match '^(Y|y|Yes|yes)$') {
     Write-Host "Uploading to board ($Port)..." -ForegroundColor Cyan
     & $ArduinoCli upload -p $Port -b $Board --input-dir $BuildDir
 

@@ -91,7 +91,7 @@ async function loadSelectedRelease(option) {
   try {
     const response = await fetch(option.value, { cache: 'no-store' });
     if (!response.ok) throw new Error(`Release could not be loaded (${response.status}).`);
-    await chooseRelease(await response.blob(), option.textContent);
+    await chooseRelease(await response.blob(), option.dataset.label || option.textContent);
     onlineStatus.textContent = 'Online release loaded.';
   } catch (error) {
     onlineStatus.textContent = error.message;
@@ -111,7 +111,8 @@ async function loadOnlineReleases() {
     for (const release of releases) {
       const option = document.createElement('option');
       option.value = release.url;
-      option.textContent = release.label || release.version;
+      option.dataset.label = release.label || release.version;
+      option.textContent = `${option.dataset.label} ${release.version}`;
       releaseSelect.append(option);
     }
     onlineStatus.textContent = `${releases.length} online release(s) available.`;
