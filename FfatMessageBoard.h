@@ -14,6 +14,7 @@
 class FfatMessageBoard
 {
 public:
+  // The live file is append-only; temporary paths support atomic-style repair and replacement.
   static constexpr const char* FILE_PATH = "/messages.dat";
   static constexpr const char* REPAIR_PATH = "/messages.repair";
   static constexpr const char* BACKUP_PATH = "/messages.backup";
@@ -22,6 +23,7 @@ public:
   static constexpr size_t MAX_MESSAGE_LENGTH = 1024;
   static constexpr size_t MAX_INDEXED_MESSAGES = 4096;
 
+  // Public, null-terminated view of one fixed-size record on the FFat volume.
   struct Message
   {
     uint32_t id;
@@ -46,6 +48,7 @@ public:
     Unavailable
   };
 
+  // Mount FFat, allocate the bounded index, and repair valid data during startup.
   bool begin()
   {
     messageCount_ = 0;
@@ -133,6 +136,7 @@ public:
     size_t offset = header.headerSize;
     file.seek(offset);
     DiskRecord record{};
+    // Rebuild the in-memory index only from complete, checksum-valid records.
     while (offset + recordSize <= validSize && file.read(
                reinterpret_cast<uint8_t*>(&record), recordSize) == recordSize)
     {
@@ -154,6 +158,7 @@ public:
 
     if (needsRepair)
     {
+      // Preserve the valid prefix and replace a torn/corrupt tail on the next boot.
       File source = FFat.open(FILE_PATH, FILE_READ);
       File repairFile = FFat.open(REPAIR_PATH, FILE_WRITE);
       bool repaired = source && repairFile && writeHeader(repairFile);
@@ -211,6 +216,8 @@ public:
            indexCapacity_ > 0 && FFat.totalBytes() > 0;
   }
 
+  // Report storage/index exhaustion separately from invalid input and unavailable storage.
+  // Append one validated record and update the sorted lookup index under the storage mutex.
   SubmitResult enqueue(const char* name,
                        const char* text,
                        int64_t createdAtEpoch,
@@ -278,6 +285,7 @@ public:
     return SubmitResult::Accepted;
   }
 
+  // Replace the database with an empty, valid file rather than truncating the live file in place.
   bool reset()
   {
     if (!ready() || importInProgress_ || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
@@ -321,6 +329,7 @@ public:
 
   bool beginImport(size_t expectedBytes)
   {
+    // Upload into a separate file first; live data remains intact until validation succeeds.
     importError_ = "none";
     if (!ready() || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
     {
@@ -354,6 +363,7 @@ public:
     return importInProgress_;
   }
 
+  // Accept upload chunks only while an import has been started and its temporary file is open.
   bool appendImportData(const uint8_t* data, size_t length)
   {
     if (data == nullptr || length == 0 ||
@@ -371,6 +381,7 @@ public:
     return success;
   }
 
+  // Validate and install the staged import; on failure the previous board remains installed.
   bool finishImport()
   {
     if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
@@ -388,6 +399,7 @@ public:
     importFile_.flush();
     importFile_.close();
 
+    // Parse into a repair file, then swap it in so malformed JSON cannot replace live data.
     FFat.remove(BACKUP_PATH);
     File source = FFat.open(IMPORT_PATH, FILE_READ);
     File replacement = FFat.open(REPAIR_PATH, FILE_WRITE);
@@ -446,6 +458,7 @@ public:
     return importError_;
   }
 
+  // Discard only the staged upload; the currently installed message file is left untouched.
   void abortImport()
   {
     if (mutex_ != nullptr && xSemaphoreTake(mutex_, portMAX_DELAY) == pdTRUE)
@@ -457,11 +470,13 @@ public:
     }
   }
 
+  // Counts and storage metrics are snapshots; mutation and file operations use the mutex.
   uint32_t messageCount() const
   {
     return messageCount_;
   }
 
+  // Binary-search the ID-sorted index to resume incremental polling after the last seen message.
   uint32_t firstIndexAfter(uint32_t id) const
   {
     uint32_t lower = 0;
@@ -511,6 +526,7 @@ public:
     return indexCapacity_ * sizeof(IndexEntry);
   }
 
+  // Open a short-lived reader while protecting the file from concurrent replacement.
   bool openReader(File& file) const
   {
     if (mutex_ == nullptr || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
@@ -541,9 +557,11 @@ public:
       xSemaphoreGive(mutex_);
       return false;
     }
+    // The caller must close through closeReaderExclusive() to release this lock.
     return true;
   }
 
+  // Pair this with openReaderExclusive(); the lock covers the caller's complete read/stream.
   void closeReaderExclusive(File& file) const
   {
     if (file)
@@ -553,6 +571,7 @@ public:
     xSemaphoreGive(mutex_);
   }
 
+  // Sequential reads are used for export; indexed reads support newest-first and paged queries.
   bool readNext(File& file, Message& message) const
   {
     DiskRecord record{};
@@ -572,6 +591,7 @@ public:
     return true;
   }
 
+  // Lock around a single indexed read when the caller does not already hold the board lock.
   bool readAt(File& file, uint32_t index, Message& message) const
   {
     if (mutex_ == nullptr || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
@@ -583,11 +603,13 @@ public:
     return success;
   }
 
+  // Use only while holding the exclusive reader lock returned by openReaderExclusive().
   bool readAtExclusive(File& file, uint32_t index, Message& message) const
   {
     return readAtUnlocked(file, index, message);
   }
 
+  // Fetch the newest message under one lock so its file and index position stay consistent.
   bool readLatest(Message& message) const
   {
     if (mutex_ == nullptr || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
@@ -607,6 +629,7 @@ public:
   }
 
 private:
+  // Packed structures make on-disk record size stable and permit direct fixed-size reads.
   static constexpr uint32_t RECORD_MAGIC = 0x41524D31;
   static constexpr uint32_t STORAGE_MAGIC = 0x41524631;
   static constexpr uint16_t CURRENT_FORMAT_VERSION = 2;
@@ -658,6 +681,7 @@ private:
       return false;
     }
 
+    // Keep entries ordered by ID for firstIndexAfter() binary searches.
     size_t position = messageCount_;
     while (position > 0 && index_[position - 1].id > id)
     {
@@ -675,6 +699,7 @@ private:
 
   bool rebuildIndex()
   {
+    // Reconstruct offsets after replacing the data file; IDs remain sorted for efficient lookup.
     File file;
     if (index_ == nullptr || !openReaderUnlocked(file))
     {
@@ -705,6 +730,7 @@ private:
 
   static bool writeHeader(File& file)
   {
+    // Readers reject files whose layout/version differs from this firmware's packed record format.
     StorageHeader header{
         STORAGE_MAGIC,
         CURRENT_FORMAT_VERSION,
@@ -716,6 +742,7 @@ private:
 
   bool openReaderUnlocked(File& file) const
   {
+    // Caller owns mutex_; validate the header before positioning at the first record.
     file = FFat.open(FILE_PATH, FILE_READ);
     if (!file)
     {
@@ -728,6 +755,7 @@ private:
 
   bool readAtUnlocked(File& file, uint32_t index, Message& message) const
   {
+    // Caller owns mutex_; offsets come from the validated in-memory index.
     if (!file || index >= messageCount_ || index_[index].id == 0 ||
       !file.seek(index_[index].offset))
       {
@@ -748,6 +776,7 @@ private:
 
   static uint32_t checksum(const DiskRecord& record)
   {
+    // FNV-1a covers every record field before checksum, detecting partial writes and corruption.
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
     uint32_t value = 2166136261UL;
     for (size_t index = 0; index < offsetof(DiskRecord, checksum); ++index)
@@ -760,6 +789,7 @@ private:
 
   static bool isValid(const DiskRecord& record)
   {
+    // Validate lengths before copying into public buffers, as well as integrity and enum bounds.
     return record.magic == RECORD_MAGIC && record.id != 0 &&
            record.priority <= static_cast<uint8_t>(Priority::Red) &&
            record.nameLength > 0 && record.nameLength <= MAX_NAME_LENGTH &&
@@ -770,6 +800,7 @@ private:
   class BufferedReader
   {
   public:
+    // A small read-ahead buffer reduces filesystem calls while parsing imported JSON.
     BufferedReader(File& file, uint8_t* buffer) : file_(file), buffer_(buffer) {}
 
     bool readByte(char& value)
@@ -811,6 +842,7 @@ private:
   class BufferedWriter
   {
   public:
+    // Batch serialized records to reduce small writes during import, repair, and rewrite.
     BufferedWriter(File& file, uint8_t* buffer) : file_(file), buffer_(buffer) {}
 
     bool write(const uint8_t* data, size_t length)
@@ -878,6 +910,7 @@ private:
 
   static bool readString(BufferedReader& reader, char* destination, size_t capacity)
   {
+    // Decode JSON escapes into a bounded buffer; this importer accepts only ASCII \u escapes.
     if (!expect(reader, '"'))
     {
       return false;
@@ -964,6 +997,7 @@ private:
 
   static bool parseTimestamp(const char* value, int64_t& epoch)
   {
+    // Convert validated UTC calendar fields directly to epoch seconds without timezone state.
     int year = 0;
     int month = 0;
     int day = 0;
@@ -1025,6 +1059,7 @@ private:
   static bool parseImport(File& source, File& replacement,
                           uint32_t& importedCount, uint32_t& highestId)
   {
+    // Stream the known export shape with fixed buffers instead of loading JSON into RAM.
     static uint8_t readerBuffer[BufferedReader::BUFFER_SIZE];
     static uint8_t writerBuffer[BufferedWriter::BUFFER_SIZE];
     BufferedReader reader(source, readerBuffer);
@@ -1032,6 +1067,7 @@ private:
     char key[32]{};
     char value = 0;
     bool foundMessages = false;
+    // Locate the exported messages array while allowing metadata fields before it.
     while (readByte(reader, value))
     {
       if (value == '"')
@@ -1159,6 +1195,7 @@ private:
       return false;
     }
 
+    // Edits and deletes rewrite through a temporary file because records have fixed size.
     appendFile_.close();
     File source = FFat.open(FILE_PATH, FILE_READ);
     File replacement = FFat.open(REPAIR_PATH, FILE_WRITE);
@@ -1265,6 +1302,7 @@ private:
 
   static bool installRepairFile()
   {
+    // Keep a backup until the replacement is installed so a failed rename can be rolled back.
     if (!FFat.exists(FILE_PATH))
     {
       return FFat.rename(REPAIR_PATH, FILE_PATH);

@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 
+// Store the complete UI in flash; the firmware can serve it without a filesystem asset.
 static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
 <!doctype html>
 <html lang="en">

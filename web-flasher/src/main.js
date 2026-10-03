@@ -20,6 +20,7 @@ function log(message) {
 }
 
 function isExpectedManifestResetError(error) {
+  // Some devices reset after manifestation and WebUSB reports that reset as a transfer error.
   const message = error instanceof Error ? error.message : String(error);
   return message.includes('reset for manifestation') &&
     message.includes('Unable to reset the device');
@@ -43,6 +44,7 @@ function setDetails(manifest, file) {
 }
 
 async function readRelease(file) {
+  // Validate the manifest and load its images before requesting USB access.
   const zip = await JSZip.loadAsync(file);
   const manifestEntry = zip.file('manifest.json');
   if (!manifestEntry) throw new Error('manifest.json is missing from the release ZIP.');
@@ -87,6 +89,7 @@ async function chooseRelease(file, fileName) {
 
 async function loadSelectedRelease(option) {
   if (!option?.value) return;
+  // Release URLs are kept relative so the same build works from any deployment directory.
   onlineStatus.textContent = 'Loading release from the web server ...';
   try {
     const response = await fetch(option.value, { cache: 'no-store' });
@@ -104,6 +107,7 @@ releaseSelect.addEventListener('change', async () => {
 
 async function loadOnlineReleases() {
   try {
+    // The manifest list is fetched relative to the page, including on a hosted subpath.
     const response = await fetch('./releases.json', { cache: 'no-store' });
     if (!response.ok) throw new Error('Release list is not available.');
     const releases = (await response.json()).sort((left, right) =>
@@ -117,6 +121,7 @@ async function loadOnlineReleases() {
     }
     onlineStatus.textContent = `${releases.length} online release(s) available.`;
     if (releases.length > 0) {
+      // Default to the newest release while keeping older versions selectable.
       releaseSelect.selectedIndex = 0;
       await loadSelectedRelease(releaseSelect.selectedOptions[0]);
     }
@@ -162,6 +167,7 @@ flashButton.addEventListener('click', async () => {
     connectionStatus.textContent = 'Connected. Writing firmware over USB DFU ...';
     await dfu.open();
     try {
+      // The Nano ESP32 DFU interface uses 2048-byte blocks; the manifest supplies the image.
       await dfu.do_download(2048, selectedRelease.images[0].data.buffer, true);
     } catch (error) {
       if (!isExpectedManifestResetError(error)) {
@@ -179,6 +185,7 @@ flashButton.addEventListener('click', async () => {
     connectionStatus.textContent = 'Flashing failed.';
     log(`Error: ${error.message}`);
   } finally {
+    // Close on both success and failure, including resets reported after a completed transfer.
     try { await dfu?.close(); } catch { }
     flashButton.disabled = false;
     releaseSelect.disabled = false;

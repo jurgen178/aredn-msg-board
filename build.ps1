@@ -24,6 +24,7 @@ $ReleaseDirectory = Join-Path $ReleaseRoot "aredn-message-board-v$Version"
 $ReleaseZip = Join-Path $ReleaseRoot "aredn-message-board-v$Version.zip"
 $PublicReleaseDirectory = Join-Path $PSScriptRoot "web-flasher\public\releases"
 $WebFlasherDirectory = Join-Path $PSScriptRoot "web-flasher"
+$WebFlasherPort = 5173  # 5173 is the standard port for Vite
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
     -not (Get-Command npm -ErrorAction SilentlyContinue)) {
@@ -141,7 +142,56 @@ if ($WebBuildExitCode -ne 0) {
     exit $WebBuildExitCode
 }
 
-Write-Host "`n[5/5] Board upload" -ForegroundColor Cyan
+Write-Host "`n[5/6] Starting local web flasher..." -ForegroundColor Cyan
+$WebFlasherUrl = "http://localhost:$WebFlasherPort/"
+$WebPageReady = $false
+try {
+    $WebPageReady = (Invoke-WebRequest -Uri $WebFlasherUrl -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200
+}
+catch {
+    $WebPageReady = $false
+}
+
+if (-not $WebPageReady) {
+    $NodePath = (Get-Command node -ErrorAction Stop).Source
+    $NpmCliPath = Join-Path (Split-Path $NodePath) "node_modules\npm\bin\npm-cli.js"
+    if (-not (Test-Path $NpmCliPath)) {
+        throw "npm CLI not found: $NpmCliPath"
+    }
+    $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $StartInfo.FileName = $NodePath
+    $StartInfo.WorkingDirectory = $WebFlasherDirectory
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    [void]$StartInfo.ArgumentList.Add($NpmCliPath)
+    [void]$StartInfo.ArgumentList.Add("run")
+    [void]$StartInfo.ArgumentList.Add("dev")
+    [void]$StartInfo.ArgumentList.Add("--")
+    [void]$StartInfo.ArgumentList.Add("--host")
+    [void]$StartInfo.ArgumentList.Add("localhost")
+    [void]$StartInfo.ArgumentList.Add("--port")
+    [void]$StartInfo.ArgumentList.Add([string]$WebFlasherPort)
+    $WebServerProcess = [System.Diagnostics.Process]::Start($StartInfo)
+
+    for ($Attempt = 0; $Attempt -lt 40 -and -not $WebPageReady; $Attempt++) {
+        if ($WebServerProcess.HasExited) {
+            break
+        }
+        try {
+            $WebPageReady = (Invoke-WebRequest -Uri $WebFlasherUrl -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200
+        }
+        catch {
+            $WebPageReady = $false
+        }
+    }
+}
+
+if (-not $WebPageReady) {
+    throw "Local web flasher did not start: $WebFlasherUrl"
+}
+Write-Host "Test page: $WebFlasherUrl" -ForegroundColor Green
+
+Write-Host "`n[6/6] Board upload" -ForegroundColor Cyan
 $UploadChoice = Read-Host "Upload firmware to board on $Port? [Y/n]"
 if ([string]::IsNullOrWhiteSpace($UploadChoice) -or $UploadChoice -match '^(Y|y|Yes|yes)$') {
     Write-Host "Uploading to board ($Port)..." -ForegroundColor Cyan
@@ -158,3 +208,9 @@ if ([string]::IsNullOrWhiteSpace($UploadChoice) -or $UploadChoice -match '^(Y|y|
 else {
     Write-Host "Upload skipped. Firmware package and web flasher are ready." -ForegroundColor Yellow
 }
+
+Write-Host ""
+Write-Host "Local web flasher: $WebFlasherUrl" -ForegroundColor Green
+Write-Host "Stop the local web flasher with:" -ForegroundColor Cyan
+Write-Host '  $connection = Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue'
+Write-Host '  if ($connection) { Stop-Process -Id $connection.OwningProcess -Force }'

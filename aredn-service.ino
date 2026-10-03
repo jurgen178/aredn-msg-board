@@ -15,6 +15,7 @@
 
 namespace
 {
+// Time bounds reject uninitialized, implausible, or far-future clock values.
 constexpr char WIFI_SSID[] = SECRET_SSID;
 constexpr char WIFI_PASSWORD[] = SECRET_PASS;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
@@ -35,14 +36,17 @@ constexpr int8_t OLED_RESET = -1;
 constexpr uint8_t OLED_ADDRESS = 0x3C;
 constexpr uint32_t OLED_PAGE_INTERVAL_MS = 5000;
 
+// These objects are shared by asynchronous HTTP callbacks and the main Arduino loop.
 AsyncWebServer server(80);
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
 FfatMessageBoard messageBoard;
+// Atomic fields are read or updated from both the server task and the main loop.
 std::atomic<uint8_t> deviceTimeSource{TIME_SOURCE_UNSET};
 std::atomic<uint32_t> adminSessionToken{0};
 std::atomic<uint32_t> boardRevision{1};
 std::atomic<uint32_t> fullRefreshRevision{0};
 std::atomic<bool> importUploadActive{false};
+// Client samples are protected because HTTP handlers may run concurrently.
 SemaphoreHandle_t clientTimeMutex = nullptr;
 int64_t clientTimeSamples[CLIENT_TIME_AGREEMENT_COUNT]{};
 uint32_t clientTimeSampleClients[CLIENT_TIME_AGREEMENT_COUNT]{};
@@ -59,6 +63,7 @@ FfatMessageBoard::Message latestMessage{};
 
 struct ImportUploadState
 {
+  // The upload callback records failure until the final request handler sends its response.
   bool failed = false;
   bool started = false;
 };
@@ -72,6 +77,7 @@ void drawDisplayLine(uint8_t row, const char* label, const char* value)
 
 void printDisplayUtf8(const char* value)
 {
+  // The OLED font cannot render multibyte UTF-8; replace each complete code point with one '?'.
   const uint8_t* current = reinterpret_cast<const uint8_t*>(value);
   while (*current != '\0')
   {
@@ -107,6 +113,7 @@ void printDisplayUtf8(const char* value)
 
 void printDisplayUtf8Ellipsis(const char* value, uint8_t maxCharacters)
 {
+  // Count UTF-8 code points rather than bytes so truncation never splits a character.
   const uint8_t* current = reinterpret_cast<const uint8_t*>(value);
   uint8_t characterCount = 0;
   while (*current != '\0')
@@ -168,6 +175,7 @@ const char* messagePriorityName(uint8_t priority);
 
 void refreshLatestDisplayMessage()
 {
+  // Cache the last post so display refreshes do not reread FFat on every page update.
   latestMessageAvailable = messageBoard.readLatest(latestMessage);
 }
 
@@ -216,6 +224,7 @@ void drawBoardDisplay()
   }
   else
   {
+    // The second page shows the newest cached message; the author is truncated to fit the OLED.
     if (!latestMessageAvailable)
     {
       display.println("NO MESSAGES");
@@ -248,6 +257,7 @@ void drawBoardDisplay()
 
 void initializeDisplay()
 {
+  // Display failure is non-fatal: the network service can operate without the OLED.
   Wire.begin();
   Serial.println("I2C initialized");
 
@@ -291,6 +301,7 @@ char foldSearchCharacter(char value)
 
 bool containsSearchTerm(const char* value, const String& searchTerm)
 {
+  // Search is deliberately ASCII case-insensitive; stored UTF-8 bytes otherwise match exactly.
   if (searchTerm.isEmpty())
   {
     return true;
@@ -313,11 +324,13 @@ bool containsSearchTerm(const char* value, const String& searchTerm)
 
 bool isDeviceTimeValid()
 {
+  // The platform clock's boot-time default is earlier than this accepted epoch.
   return static_cast<int64_t>(time(nullptr)) >= MIN_VALID_EPOCH;
 }
 
 const char* deviceTimeSourceName()
 {
+  // A stored source is meaningful only while the clock itself passes validation.
   if (!isDeviceTimeValid())
   {
     return "unset";
@@ -333,11 +346,13 @@ const char* deviceTimeSourceName()
 
 void resetClientTimeSamples()
 {
+  // Discard stale votes whenever a new clock value is accepted.
   clientTimeSampleCount = 0;
 }
 
 bool addClientTimeSample(int64_t epoch, uint32_t clientAddress)
 {
+  // Do not let one client satisfy the multi-client agreement threshold repeatedly.
   for (uint8_t index = 0; index < clientTimeSampleCount; ++index)
   {
     if (clientTimeSampleClients[index] == clientAddress)
@@ -366,6 +381,7 @@ bool addClientTimeSample(int64_t epoch, uint32_t clientAddress)
 
 void synchronizeFromClient(int64_t clientEpoch, uint32_t clientAddress)
 {
+  // Client time is accepted immediately only for an unset clock or a small correction.
   if (clientTimeMutex == nullptr || clientEpoch < CLIENT_TIME_BOOTSTRAP_EPOCH ||
       clientEpoch > MAX_VALID_EPOCH ||
       xSemaphoreTake(clientTimeMutex, portMAX_DELAY) != pdTRUE)
@@ -379,6 +395,7 @@ void synchronizeFromClient(int64_t clientEpoch, uint32_t clientAddress)
   if (deviceEpoch < CLIENT_TIME_BOOTSTRAP_EPOCH ||
       deviceTimeSource.load(std::memory_order_acquire) == TIME_SOURCE_UNSET)
   {
+    // With no trustworthy clock yet, the first plausible browser timestamp bootstraps it.
     if (settimeofday(&clientTime, nullptr) == 0)
     {
       deviceTimeSource.store(TIME_SOURCE_CLIENT, std::memory_order_release);
@@ -404,6 +421,7 @@ void synchronizeFromClient(int64_t clientEpoch, uint32_t clientAddress)
 
   if (manualTime || difference > CLIENT_TIME_MAX_SAMPLE_SPREAD)
   {
+    // A large correction, or any correction after manual setup, needs distinct-client agreement.
     if (!addClientTimeSample(clientEpoch, clientAddress))
     {
       xSemaphoreGive(clientTimeMutex);
@@ -420,6 +438,7 @@ void synchronizeFromClient(int64_t clientEpoch, uint32_t clientAddress)
       }
       if (highest - lowest <= CLIENT_TIME_MAX_SAMPLE_SPREAD)
       {
+        // The median limits the effect of a single outlying client timestamp.
         int64_t median = clientTimeSamples[0];
         for (uint8_t index = 0; index < CLIENT_TIME_AGREEMENT_COUNT; ++index)
         {
@@ -448,6 +467,7 @@ void synchronizeFromClient(int64_t clientEpoch, uint32_t clientAddress)
 
 void appendJsonString(Print& output, const char* value)
 {
+  // Stream escaped JSON directly to the response instead of allocating a second copy.
   output.write('"');
   for (const unsigned char* character = reinterpret_cast<const unsigned char*>(value);
        *character != '\0';
@@ -481,6 +501,7 @@ void appendJsonString(Print& output, const char* value)
 
 void appendIsoTimestamp(Print& output, int64_t epoch)
 {
+  // Exports use UTC ISO-8601 timestamps, independent of the device's local timezone.
   const time_t timestamp = static_cast<time_t>(epoch);
   struct tm utcTime{};
   char formatted[21]{};
@@ -496,6 +517,7 @@ void appendIsoTimestamp(Print& output, int64_t epoch)
 
 const char* messagePriorityName(uint8_t priority)
 {
+  // Green is also the compatibility fallback for older records without a priority field.
   switch (static_cast<FfatMessageBoard::Priority>(priority))
   {
     case FfatMessageBoard::Priority::Orange: return "orange";
@@ -506,6 +528,7 @@ const char* messagePriorityName(uint8_t priority)
 
 bool parseMessagePriority(const String& value, FfatMessageBoard::Priority& priority)
 {
+  // Accept only the exact priority tokens shared by the browser and import/export formats.
   if (value == "green")
   {
     priority = FfatMessageBoard::Priority::Green;
@@ -545,6 +568,7 @@ void formatSerialClock(char* output, size_t outputSize)
 
 bool isAdminAuthenticated(AsyncWebServerRequest* request)
 {
+  // Only the current in-memory token is accepted; restarting the device invalidates sessions.
   const uint32_t token = adminSessionToken.load(std::memory_order_acquire);
   if (token == 0 || !request->hasHeader("Cookie"))
   {
@@ -557,6 +581,7 @@ bool isAdminAuthenticated(AsyncWebServerRequest* request)
 
 void sendAdminRequired(AsyncWebServerRequest* request)
 {
+  // Keep authorization failures consistent for every protected route.
   request->send(401, "application/json", "{\"error\":\"admin_required\"}");
 }
 
@@ -572,6 +597,7 @@ void writeMessageItems(AsyncResponseStream& response,
                        const String* searchTerm = nullptr,
                        int priorityFilter = -1)
 {
+  // The ID-sorted index lets incremental polling skip records already seen by the client.
   if (hasMore != nullptr)
   {
     *hasMore = false;
@@ -582,8 +608,10 @@ void writeMessageItems(AsyncResponseStream& response,
     return;
   }
 
+  // Search without an ID boundary needs a full scan; ordinary polling can use the sorted index.
   const bool sequentialSearch = searchTerm != nullptr && beforeId == 0 && afterId == 0;
   const bool incrementalLatest = afterId != 0 && beforeId == 0 && searchTerm == nullptr;
+  // Narrow incremental reads to the first newer ID; filtered and paged requests scan normally.
   const uint32_t firstIndexAfter = incrementalLatest
       ? messageBoard.firstIndexAfter(afterId)
       : 0;
@@ -659,6 +687,7 @@ void handleSubmitMessage(AsyncWebServerRequest* request)
 {
   if (request->hasParam("c_time", true))
   {
+    // Message submissions also carry client time so a browser can initialize the board clock.
     const String clientTimeValue = request->getParam("c_time", true)->value();
     char* parseEnd = nullptr;
     const long long clientEpoch = strtoll(clientTimeValue.c_str(), &parseEnd, 10);
@@ -709,6 +738,7 @@ void handleSubmitMessage(AsyncWebServerRequest* request)
   }
 
   uint32_t messageId = 0;
+  // Persist only after validation and a usable timestamp are available.
   const FfatMessageBoard::SubmitResult result = messageBoard.enqueue(
       author.c_str(), text.c_str(), static_cast<int64_t>(time(nullptr)), priority, messageId);
   if (result == FfatMessageBoard::SubmitResult::Invalid)
@@ -737,6 +767,7 @@ void handleSubmitMessage(AsyncWebServerRequest* request)
 
 void registerRoutes()
 {
+  // Route handlers are asynchronous; long-running storage operations use the board's mutex.
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request)
   {
     AsyncWebServerResponse* response = request->beginResponse_P(
@@ -755,6 +786,7 @@ void registerRoutes()
       return;
     }
 
+    // Hold the exclusive reader lock while streaming so records cannot be rewritten mid-export.
     AsyncResponseStream* response = request->beginResponseStream("application/json; charset=utf-8");
     response->addHeader("Content-Disposition", "attachment; filename=aredn-messages.json");
     response->printf("{\n  \"format\": \"aredn-message-board\",\n  \"message_count\": %lu,\n  \"messages\": [\n",
@@ -775,6 +807,7 @@ void registerRoutes()
       return;
     }
 
+    // There is one active administrator session; a new login replaces its token.
     uint32_t token = esp_random();
     if (token == 0)
     {
@@ -838,6 +871,7 @@ void registerRoutes()
   }, nullptr, [](AsyncWebServerRequest* request, uint8_t* data,
                  size_t length, size_t index, size_t total)
   {
+    // AsyncWebServer delivers uploads in chunks; keep state on the request until the final chunk.
     if (index == 0)
     {
       request->_tempObject = new ImportUploadState();
@@ -1004,6 +1038,7 @@ void registerRoutes()
 
     const bool clockValid = isDeviceTimeValid();
     const time_t currentEpoch = clockValid ? time(nullptr) : 0;
+    // Keep interactive pages bounded by default; callers must opt in to a larger page.
     uint32_t limit = 20;
     if (request->hasParam("all"))
     {
@@ -1057,6 +1092,7 @@ void registerRoutes()
     bool hasMore = false;
     AsyncResponseStream* response = request->beginResponseStream("application/json");
     const uint32_t currentRevision = boardRevision.load(std::memory_order_acquire);
+    // Clients use these compact fields to decide whether polling can stay incremental.
     const bool requiresFullRefresh = fullRefreshRevision.load(std::memory_order_acquire) == currentRevision;
     response->printf("{\"r\":%lu,\"f\":%s,\"v\":%s,\"s\":\"%s\",\"e\":%lld,\"p\":[",
              static_cast<unsigned long>(currentRevision),
@@ -1177,6 +1213,7 @@ void registerRoutes()
 
 void setup()
 {
+  // Bring up diagnostics and the optional display before initializing storage and networking.
   Serial.begin(115200);
 
   unsigned long startZeit = millis();
@@ -1234,8 +1271,10 @@ void setup()
   Serial.printf("Wi-Fi connection started (status %d)\n", static_cast<int>(WiFi.status()));
 
   Serial.println("Waiting for AREDN WLAN connection ...");
+  // Bound startup delay so the HTTP service remains available while Wi-Fi reconnects later.
   const uint32_t wifiWaitStart = millis();
   constexpr uint32_t WIFI_STARTUP_TIMEOUT_MS = 30000;
+  // Start the HTTP service even when the mesh network is temporarily unavailable.
   while (WiFi.status() != WL_CONNECTED &&
          millis() - wifiWaitStart < WIFI_STARTUP_TIMEOUT_MS)
   {
@@ -1270,6 +1309,7 @@ void loop()
 
   if (displayAvailable)
   {
+    // Refresh the cached latest post only when a write changes the board revision.
     const uint32_t currentRevision = boardRevision.load(std::memory_order_acquire);
     const bool boardChanged = currentRevision != displayedBoardRevision;
     if (boardChanged)
@@ -1279,6 +1319,7 @@ void loop()
     }
     if (boardChanged || now - lastDisplayUpdate >= OLED_PAGE_INTERVAL_MS)
     {
+      // Show changed content immediately; otherwise alternate between status and message pages.
       if (!boardChanged && lastDisplayUpdate != 0)
       {
         displayedPage = static_cast<uint8_t>(displayedPage == 0 ? 1 : 0);
@@ -1315,6 +1356,7 @@ void loop()
     wasConnected = false;
   }
 
+  // Retry on a timer rather than blocking the loop while the access point is unavailable.
   if (!connected && now - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS)
   {
     lastReconnectAttempt = now;
