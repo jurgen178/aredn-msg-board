@@ -127,7 +127,7 @@ Submit a message:
 Invoke-WebRequest http://device-address/api/messages -Method Post -Body @{
   name = 'W6AM'
   text = 'Acknowledged.'
-  priority = 'green'
+  priority = 'green'    # 'green' = normal, 'orange' = important, 'red' = urgent
   c_time = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 }
 ```
