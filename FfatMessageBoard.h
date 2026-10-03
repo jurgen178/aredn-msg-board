@@ -1,0 +1,1224 @@
+#pragma once
+
+#include <Arduino.h>
+#include <FFat.h>
+#include <cctype>
+#include <cstddef>
+#include <cstdio>
+#include <ctime>
+#include <new>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <esp_task_wdt.h>
+
+class FfatMessageBoard
+{
+public:
+  static constexpr const char* FILE_PATH = "/messages.dat";
+  static constexpr const char* REPAIR_PATH = "/messages.repair";
+  static constexpr const char* BACKUP_PATH = "/messages.backup";
+  static constexpr const char* IMPORT_PATH = "/messages.import";
+  static constexpr const char* INCOMPATIBLE_PATH = "/messages.incompatible";
+  static constexpr size_t MAX_NAME_LENGTH = 32;
+  static constexpr size_t MAX_MESSAGE_LENGTH = 512;
+
+  struct Message
+  {
+    uint32_t id;
+    int64_t createdAtEpoch;
+    char name[MAX_NAME_LENGTH + 1];
+    char text[MAX_MESSAGE_LENGTH + 1];
+  };
+
+  enum class SubmitResult
+  {
+    Accepted,
+    Invalid,
+    Unavailable
+  };
+
+  bool begin()
+  {
+    messageCount_ = 0;
+    nextId_ = 1;
+    if (mutex_ == nullptr)
+    {
+      mutex_ = xSemaphoreCreateMutex();
+    }
+    if (mutex_ == nullptr || !FFat.begin(false))
+    {
+      return false;
+    }
+    if (index_ == nullptr)
+    {
+      indexCapacity_ = FFat.totalBytes() / sizeof(DiskRecord);
+      index_ = indexCapacity_ == 0 ? nullptr : new (std::nothrow) IndexEntry[indexCapacity_];
+      if (index_ == nullptr)
+      {
+        return false;
+      }
+    }
+
+    if (!FFat.exists(FILE_PATH) && FFat.exists(BACKUP_PATH))
+    {
+      if (!FFat.rename(BACKUP_PATH, FILE_PATH))
+      {
+        return false;
+      }
+    }
+    else if (FFat.exists(FILE_PATH) && FFat.exists(BACKUP_PATH))
+    {
+      FFat.remove(BACKUP_PATH);
+    }
+
+    File file = FFat.open(FILE_PATH, FILE_READ);
+    if (!file)
+    {
+      file = FFat.open(FILE_PATH, FILE_WRITE);
+      const bool created = file && writeHeader(file);
+      if (!created)
+      {
+        if (file) file.close();
+        return false;
+      }
+      file.close();
+      return true;
+    }
+
+    if (file.size() == 0)
+    {
+      file.close();
+      file = FFat.open(FILE_PATH, FILE_WRITE);
+      const bool initialized = file && writeHeader(file);
+      if (file) file.close();
+      return initialized;
+    }
+
+    StorageHeader header{};
+    file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header));
+    if (!isCurrentHeader(header))
+    {
+      file.close();
+      if (FFat.exists(INCOMPATIBLE_PATH) || !FFat.rename(FILE_PATH, INCOMPATIBLE_PATH))
+      {
+        return false;
+      }
+      file = FFat.open(FILE_PATH, FILE_WRITE);
+      const bool initialized = file && writeHeader(file);
+      if (file)
+      {
+        file.close();
+      }
+      if (!initialized)
+      {
+        FFat.remove(FILE_PATH);
+        FFat.rename(INCOMPATIBLE_PATH, FILE_PATH);
+        return false;
+      }
+      return true;
+    }
+
+    const size_t recordSize = sizeof(DiskRecord);
+    const size_t dataSize = file.size() - header.headerSize;
+    const size_t validSize = header.headerSize + (dataSize / recordSize) * recordSize;
+    uint32_t highestId = 0;
+    size_t offset = header.headerSize;
+    file.seek(offset);
+    DiskRecord record{};
+    while (offset + recordSize <= validSize && file.read(
+               reinterpret_cast<uint8_t*>(&record), recordSize) == recordSize)
+    {
+      if (!isValid(record))
+      {
+        break;
+      }
+      if (!appendIndexEntry(record.id, offset))
+      {
+        file.close();
+        return false;
+      }
+      highestId = record.id > highestId ? record.id : highestId;
+      ++messageCount_;
+      offset += recordSize;
+    }
+    const bool needsRepair = offset != file.size() || offset != validSize;
+    file.close();
+
+    if (needsRepair)
+    {
+      File source = FFat.open(FILE_PATH, FILE_READ);
+      File repairFile = FFat.open(REPAIR_PATH, FILE_WRITE);
+      bool repaired = source && repairFile && writeHeader(repairFile);
+      size_t copied = header.headerSize;
+      if (source)
+      {
+        source.seek(header.headerSize);
+      }
+      while (repaired && copied < offset)
+      {
+        const size_t chunkSize = offset - copied < sizeof(DiskRecord)
+            ? offset - copied
+            : sizeof(DiskRecord);
+        uint8_t buffer[sizeof(DiskRecord)];
+        repaired = source.read(buffer, chunkSize) == chunkSize &&
+                   repairFile.write(buffer, chunkSize) == chunkSize;
+        if (repaired)
+        {
+          copied += chunkSize;
+        }
+      }
+      if (repaired)
+      {
+        repairFile.flush();
+      }
+      if (source)
+      {
+        source.close();
+      }
+      if (repairFile)
+      {
+        repairFile.close();
+      }
+      if (repaired && copied == offset)
+      {
+        repaired = installRepairFile();
+      }
+      else
+      {
+        FFat.remove(REPAIR_PATH);
+      }
+      if (!repaired)
+      {
+        return false;
+      }
+    }
+
+    nextId_ = highestId == UINT32_MAX ? 1 : highestId + 1;
+    return true;
+  }
+
+  bool ready() const
+  {
+    return mutex_ != nullptr && FFat.totalBytes() > 0;
+  }
+
+  SubmitResult enqueue(const char* name,
+                       const char* text,
+                       int64_t createdAtEpoch,
+                       uint32_t& id)
+  {
+    if (!ready() || importInProgress_)
+    {
+      return SubmitResult::Unavailable;
+    }
+    if (name == nullptr || text == nullptr)
+    {
+      return SubmitResult::Invalid;
+    }
+
+    const size_t nameLength = strlen(name);
+    const size_t textLength = strlen(text);
+    if (nameLength == 0 || nameLength > MAX_NAME_LENGTH ||
+        textLength == 0 || textLength > MAX_MESSAGE_LENGTH)
+    {
+      return SubmitResult::Invalid;
+    }
+
+    if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return SubmitResult::Unavailable;
+    }
+    if (messageCount_ >= indexCapacity_)
+    {
+      xSemaphoreGive(mutex_);
+      return SubmitResult::Unavailable;
+    }
+
+    DiskRecord record{};
+    record.magic = RECORD_MAGIC;
+    record.id = nextId_;
+    record.createdAtEpoch = createdAtEpoch;
+    record.nameLength = static_cast<uint8_t>(nameLength);
+    record.textLength = static_cast<uint16_t>(textLength);
+    memcpy(record.name, name, nameLength);
+    memcpy(record.text, text, textLength);
+    record.checksum = checksum(record);
+
+    if (!appendFile_)
+    {
+      appendFile_ = FFat.open(FILE_PATH, FILE_APPEND);
+    }
+    const bool written = appendFile_ && appendFile_.write(
+        reinterpret_cast<const uint8_t*>(&record), sizeof(record)) == sizeof(record);
+    if (written)
+    {
+      appendFile_.flush();
+    }
+
+    if (!written)
+    {
+      xSemaphoreGive(mutex_);
+      return SubmitResult::Unavailable;
+    }
+
+    id = record.id;
+    if (!appendIndexEntry(record.id,
+                sizeof(StorageHeader) +
+                  static_cast<size_t>(messageCount_) * sizeof(DiskRecord)))
+    {
+      xSemaphoreGive(mutex_);
+      return SubmitResult::Unavailable;
+    }
+    nextId_ = nextId_ == UINT32_MAX ? 1 : nextId_ + 1;
+    ++messageCount_;
+    xSemaphoreGive(mutex_);
+    return SubmitResult::Accepted;
+  }
+
+  bool reset()
+  {
+    if (!ready() || importInProgress_ || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return false;
+    }
+
+    appendFile_.close();
+    File file = FFat.open(FILE_PATH, FILE_WRITE);
+    const bool success = file && writeHeader(file);
+    if (file)
+    {
+      file.close();
+    }
+    if (success)
+    {
+      messageCount_ = 0;
+      nextId_ = 1;
+      clearIndex();
+      FFat.remove(INCOMPATIBLE_PATH);
+    }
+    xSemaphoreGive(mutex_);
+    return success;
+  }
+
+  bool update(uint32_t id, const char* name, const char* text)
+  {
+    return rewrite(id, name, text, false);
+  }
+
+  bool remove(uint32_t id)
+  {
+    return rewrite(id, nullptr, nullptr, true);
+  }
+
+  bool beginImport(size_t expectedBytes)
+  {
+    if (!ready() || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return false;
+    }
+    if (importInProgress_)
+    {
+      xSemaphoreGive(mutex_);
+      return false;
+    }
+    esp_task_wdt_delete(nullptr);
+    appendFile_.close();
+    FFat.end();
+    if (!FFat.format())
+    {
+      esp_task_wdt_add(nullptr);
+      xSemaphoreGive(mutex_);
+      return false;
+    }
+    FFat.end();
+    if (!FFat.begin(false))
+    {
+      esp_task_wdt_add(nullptr);
+      xSemaphoreGive(mutex_);
+      return false;
+    }
+    esp_task_wdt_add(nullptr);
+    File currentFile = FFat.open(FILE_PATH, FILE_READ);
+    const size_t currentSize = currentFile ? currentFile.size() : 0;
+    if (currentFile)
+    {
+      currentFile.close();
+    }
+    const size_t freeBytes = FFat.totalBytes() - FFat.usedBytes();
+    if (expectedBytes > freeBytes || currentSize > freeBytes - expectedBytes)
+    {
+      xSemaphoreGive(mutex_);
+      return false;
+    }
+    FFat.remove(IMPORT_PATH);
+    FFat.remove(REPAIR_PATH);
+    importFile_ = FFat.open(IMPORT_PATH, FILE_WRITE);
+    importInProgress_ = static_cast<bool>(importFile_);
+    if (!importInProgress_)
+    {
+      FFat.remove(IMPORT_PATH);
+    }
+    xSemaphoreGive(mutex_);
+    return importInProgress_;
+  }
+
+  bool appendImportData(const uint8_t* data, size_t length)
+  {
+    if (data == nullptr || length == 0 ||
+        xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return false;
+    }
+    if (!importInProgress_)
+    {
+      xSemaphoreGive(mutex_);
+      return false;
+    }
+    const bool success = importFile_ && importFile_.write(data, length) == length;
+    xSemaphoreGive(mutex_);
+    return success;
+  }
+
+  bool finishImport()
+  {
+    if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return false;
+    }
+    if (!importInProgress_)
+    {
+      xSemaphoreGive(mutex_);
+      return false;
+    }
+
+    importFile_.flush();
+    importFile_.close();
+
+    File source = FFat.open(IMPORT_PATH, FILE_READ);
+    File replacement = FFat.open(REPAIR_PATH, FILE_WRITE);
+    uint32_t importedCount = 0;
+    uint32_t highestId = 0;
+    bool success = source && replacement && writeHeader(replacement) &&
+        parseImport(source, replacement, importedCount, highestId);
+    if (success)
+    {
+      replacement.flush();
+    }
+    if (source)
+    {
+      source.close();
+    }
+    if (replacement)
+    {
+      replacement.close();
+    }
+    if (success)
+    {
+      success = installRepairFile();
+      if (success)
+      {
+        nextId_ = highestId == UINT32_MAX ? 1 : highestId + 1;
+        success = rebuildIndex();
+        if (!success)
+        {
+          messageCount_ = importedCount;
+        }
+        FFat.remove(INCOMPATIBLE_PATH);
+      }
+    }
+    else
+    {
+      FFat.remove(REPAIR_PATH);
+    }
+    FFat.remove(IMPORT_PATH);
+    importInProgress_ = false;
+    xSemaphoreGive(mutex_);
+    return success;
+  }
+
+  void abortImport()
+  {
+    if (mutex_ != nullptr && xSemaphoreTake(mutex_, portMAX_DELAY) == pdTRUE)
+    {
+      importFile_.close();
+      FFat.remove(IMPORT_PATH);
+      importInProgress_ = false;
+      xSemaphoreGive(mutex_);
+    }
+  }
+
+  uint8_t processPending()
+  {
+    return 0;
+  }
+
+  uint32_t pending() const
+  {
+    return 0;
+  }
+
+  uint32_t messageCount() const
+  {
+    return messageCount_;
+  }
+
+  uint32_t firstIndexAfter(uint32_t id) const
+  {
+    uint32_t lower = 0;
+    uint32_t upper = messageCount_;
+    while (lower < upper)
+    {
+      const uint32_t middle = lower + (upper - lower) / 2;
+      if (index_[middle].id <= id)
+      {
+        lower = middle + 1;
+      }
+      else
+      {
+        upper = middle;
+      }
+    }
+    return lower;
+  }
+
+  size_t usedBytes() const
+  {
+    return FFat.usedBytes();
+  }
+
+  size_t totalBytes() const
+  {
+    return FFat.totalBytes();
+  }
+
+  bool openReader(File& file) const
+  {
+    if (mutex_ == nullptr || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return false;
+    }
+    const bool success = openReaderUnlocked(file);
+    if (!success && file)
+    {
+      file.close();
+    }
+    xSemaphoreGive(mutex_);
+    return success;
+  }
+
+  bool openReaderExclusive(File& file) const
+  {
+    if (mutex_ == nullptr || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return false;
+    }
+    if (openReaderUnlocked(file))
+    {
+      return true;
+    }
+    if (file)
+    {
+      file.close();
+    }
+    xSemaphoreGive(mutex_);
+    return false;
+  }
+
+  void closeReaderExclusive(File& file) const
+  {
+    if (file)
+    {
+      file.close();
+    }
+    xSemaphoreGive(mutex_);
+  }
+
+  bool readNext(File& file, Message& message) const
+  {
+    DiskRecord record{};
+    if (!file || file.read(reinterpret_cast<uint8_t*>(&record), sizeof(record)) != sizeof(record) ||
+        !isValid(record))
+    {
+      return false;
+    }
+
+    message.id = record.id;
+    message.createdAtEpoch = record.createdAtEpoch;
+    memcpy(message.name, record.name, record.nameLength);
+    message.name[record.nameLength] = '\0';
+    memcpy(message.text, record.text, record.textLength);
+    message.text[record.textLength] = '\0';
+    return true;
+  }
+
+  bool readAt(File& file, uint32_t index, Message& message) const
+  {
+    if (mutex_ == nullptr || xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return false;
+    }
+    const bool success = readAtUnlocked(file, index, message);
+    xSemaphoreGive(mutex_);
+    return success;
+  }
+
+  bool readAtExclusive(File& file, uint32_t index, Message& message) const
+  {
+    return readAtUnlocked(file, index, message);
+  }
+
+  bool readLatest(Message& message) const
+  {
+    File file;
+    if (!openReader(file))
+    {
+      return false;
+    }
+
+    bool found = false;
+    for (uint32_t index = 0; index < messageCount_; ++index)
+    {
+      Message candidate{};
+      if (readAt(file, index, candidate) &&
+          (!found || candidate.id > message.id))
+      {
+        message = candidate;
+        found = true;
+      }
+    }
+    file.close();
+    return found;
+  }
+
+private:
+  static constexpr uint32_t RECORD_MAGIC = 0x41524D31;
+  static constexpr uint32_t STORAGE_MAGIC = 0x41524631;
+  static constexpr uint16_t CURRENT_FORMAT_VERSION = 1;
+
+  struct __attribute__((packed)) StorageHeader
+  {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t headerSize;
+    uint32_t recordSize;
+    uint32_t reserved;
+  };
+
+  struct __attribute__((packed)) DiskRecord
+  {
+    uint32_t magic;
+    uint32_t id;
+    int64_t createdAtEpoch;
+    uint8_t nameLength;
+    uint16_t textLength;
+    char name[MAX_NAME_LENGTH];
+    char text[MAX_MESSAGE_LENGTH];
+    uint32_t checksum;
+  };
+
+  struct IndexEntry
+  {
+    uint32_t id;
+    size_t offset;
+  };
+
+  bool appendIndexEntry(uint32_t id, size_t offset)
+  {
+    if (index_ == nullptr || messageCount_ >= indexCapacity_)
+    {
+      return false;
+    }
+
+    size_t position = messageCount_;
+    while (position > 0 && index_[position - 1].id > id)
+    {
+      index_[position] = index_[position - 1];
+      --position;
+    }
+    index_[position] = {id, offset};
+    return true;
+  }
+
+  void clearIndex()
+  {
+    messageCount_ = 0;
+  }
+
+  bool rebuildIndex()
+  {
+    File file;
+    if (index_ == nullptr || !openReaderUnlocked(file))
+    {
+      return false;
+    }
+
+    clearIndex();
+    DiskRecord record{};
+    while (file.read(reinterpret_cast<uint8_t*>(&record), sizeof(record)) == sizeof(record))
+    {
+      const size_t offset = file.position() - sizeof(record);
+      if (!isValid(record))
+      {
+        file.close();
+        return false;
+      }
+      if (!appendIndexEntry(record.id, offset))
+      {
+        file.close();
+        return false;
+      }
+      ++messageCount_;
+    }
+    const bool complete = file.position() == file.size();
+    file.close();
+    return complete;
+  }
+
+  static bool writeHeader(File& file)
+  {
+    StorageHeader header{
+        STORAGE_MAGIC,
+        CURRENT_FORMAT_VERSION,
+        static_cast<uint16_t>(sizeof(StorageHeader)),
+        static_cast<uint32_t>(sizeof(DiskRecord)),
+        0};
+    return file.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) == sizeof(header);
+  }
+
+  bool openReaderUnlocked(File& file) const
+  {
+    file = FFat.open(FILE_PATH, FILE_READ);
+    if (!file)
+    {
+      return false;
+    }
+    StorageHeader header{};
+    return file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) == sizeof(header) &&
+        isCurrentHeader(header) && file.seek(header.headerSize);
+  }
+
+  bool readAtUnlocked(File& file, uint32_t index, Message& message) const
+  {
+    return file &&
+        index_ != nullptr && index < messageCount_ &&
+        file.seek(index_[index].offset) &&
+        readNext(file, message);
+  }
+
+  static bool isCurrentHeader(const StorageHeader& header)
+  {
+    return header.magic == STORAGE_MAGIC &&
+           header.version == CURRENT_FORMAT_VERSION &&
+           header.headerSize == sizeof(StorageHeader) &&
+           header.recordSize == sizeof(DiskRecord);
+  }
+
+  static uint32_t checksum(const DiskRecord& record)
+  {
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
+    uint32_t value = 2166136261UL;
+    for (size_t index = 0; index < offsetof(DiskRecord, checksum); ++index)
+    {
+      value ^= bytes[index];
+      value *= 16777619UL;
+    }
+    return value;
+  }
+
+  static bool isValid(const DiskRecord& record)
+  {
+    return record.magic == RECORD_MAGIC && record.id != 0 &&
+           record.nameLength > 0 && record.nameLength <= MAX_NAME_LENGTH &&
+           record.textLength > 0 && record.textLength <= MAX_MESSAGE_LENGTH &&
+           record.checksum == checksum(record);
+  }
+
+  class BufferedReader
+  {
+  public:
+    BufferedReader(File& file, uint8_t* buffer) : file_(file), buffer_(buffer) {}
+
+    bool readByte(char& value)
+    {
+      if (bufferPosition_ == bufferSize_)
+      {
+        bufferSize_ = file_.read(buffer_, BUFFER_SIZE);
+        bufferPosition_ = 0;
+        if (bufferSize_ == 0)
+        {
+          return false;
+        }
+      }
+      value = static_cast<char>(buffer_[bufferPosition_++]);
+      return true;
+    }
+
+    bool seek(size_t position)
+    {
+      bufferPosition_ = 0;
+      bufferSize_ = 0;
+      return file_.seek(position);
+    }
+
+    size_t position() const
+    {
+      return file_.position() - (bufferSize_ - bufferPosition_);
+    }
+
+    static constexpr size_t BUFFER_SIZE = 512;
+
+  private:
+    File& file_;
+    uint8_t* buffer_;
+    size_t bufferPosition_ = 0;
+    size_t bufferSize_ = 0;
+  };
+
+  class BufferedWriter
+  {
+  public:
+    BufferedWriter(File& file, uint8_t* buffer) : file_(file), buffer_(buffer) {}
+
+    bool write(const uint8_t* data, size_t length)
+    {
+      while (length > 0)
+      {
+        const size_t available = BUFFER_SIZE - bufferSize_;
+        const size_t chunkSize = length < available ? length : available;
+        memcpy(buffer_ + bufferSize_, data, chunkSize);
+        bufferSize_ += chunkSize;
+        data += chunkSize;
+        length -= chunkSize;
+        if (bufferSize_ == BUFFER_SIZE && !flush())
+        {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    bool flush()
+    {
+      if (bufferSize_ == 0)
+      {
+        return true;
+      }
+      if (file_.write(buffer_, bufferSize_) != bufferSize_)
+      {
+        return false;
+      }
+      bufferSize_ = 0;
+      return true;
+    }
+
+    static constexpr size_t BUFFER_SIZE = 2048;
+
+  private:
+    File& file_;
+    uint8_t* buffer_;
+    size_t bufferSize_ = 0;
+  };
+
+  static bool readByte(BufferedReader& reader, char& value)
+  {
+    return reader.readByte(value);
+  }
+
+  static bool nextNonWhitespace(BufferedReader& reader, char& value)
+  {
+    while (readByte(reader, value))
+    {
+      if (!isspace(static_cast<unsigned char>(value)))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool expect(BufferedReader& reader, char expected)
+  {
+    char value = 0;
+    return nextNonWhitespace(reader, value) && value == expected;
+  }
+
+  static bool readString(BufferedReader& reader, char* destination, size_t capacity)
+  {
+    if (!expect(reader, '"'))
+    {
+      return false;
+    }
+    size_t length = 0;
+    char value = 0;
+    while (readByte(reader, value))
+    {
+      if (value == '"')
+      {
+        if (length >= capacity)
+        {
+          return false;
+        }
+        destination[length] = '\0';
+        return true;
+      }
+      if (value == '\\')
+      {
+        if (!readByte(reader, value))
+        {
+          return false;
+        }
+        switch (value)
+        {
+          case '"': case '\\': case '/': break;
+          case 'b': value = '\b'; break;
+          case 'f': value = '\f'; break;
+          case 'n': value = '\n'; break;
+          case 'r': value = '\r'; break;
+          case 't': value = '\t'; break;
+          case 'u':
+          {
+            uint16_t code = 0;
+            for (uint8_t digit = 0; digit < 4; ++digit)
+            {
+              char hex = 0;
+              if (!readByte(reader, hex)) return false;
+              code = static_cast<uint16_t>(code << 4);
+              if (hex >= '0' && hex <= '9') code = static_cast<uint16_t>(code + hex - '0');
+              else if (hex >= 'a' && hex <= 'f') code = static_cast<uint16_t>(code + hex - 'a' + 10);
+              else if (hex >= 'A' && hex <= 'F') code = static_cast<uint16_t>(code + hex - 'A' + 10);
+              else return false;
+            }
+            if (code > 0x7f) return false;
+            value = static_cast<char>(code);
+            break;
+          }
+          default: return false;
+        }
+      }
+      if (length + 1 >= capacity)
+      {
+        return false;
+      }
+      destination[length++] = value;
+    }
+    return false;
+  }
+
+  static bool readUnsigned(BufferedReader& reader, uint32_t& value)
+  {
+    char digit = 0;
+    if (!nextNonWhitespace(reader, digit) || digit < '0' || digit > '9')
+    {
+      return false;
+    }
+    value = 0;
+    do
+    {
+      const uint32_t next = value * 10UL + static_cast<uint32_t>(digit - '0');
+      if (next < value)
+      {
+        return false;
+      }
+      value = next;
+    } while (readByte(reader, digit) && digit >= '0' && digit <= '9');
+    if (reader.position() > 0)
+    {
+      reader.seek(reader.position() - 1);
+    }
+    return true;
+  }
+
+  static bool parseTimestamp(const char* value, int64_t& epoch)
+  {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    if (sscanf(value, "%4d-%2d-%2dT%2d:%2d:%2dZ", &year, &month, &day,
+               &hour, &minute, &second) != 6)
+    {
+      return false;
+    }
+    if (year < 1970 || month < 1 || month > 12 || hour < 0 || hour > 23 ||
+        minute < 0 || minute > 59 || second < 0 || second > 59)
+    {
+      return false;
+    }
+    const bool leapYear = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    const uint8_t daysInMonth[] = {
+        31, static_cast<uint8_t>(leapYear ? 29 : 28), 31, 30, 31, 30,
+        31, 31, 30, 31, 30, 31};
+    if (day < 1 || day > daysInMonth[month - 1])
+    {
+      return false;
+    }
+
+    int adjustedYear = year - (month <= 2 ? 1 : 0);
+    const int era = (adjustedYear >= 0 ? adjustedYear : adjustedYear - 399) / 400;
+    const unsigned yearOfEra = static_cast<unsigned>(adjustedYear - era * 400);
+    const unsigned adjustedMonth = static_cast<unsigned>(month + (month > 2 ? -3 : 9));
+    const unsigned dayOfYear = (153 * adjustedMonth + 2) / 5 +
+                               static_cast<unsigned>(day - 1);
+    const unsigned dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+    const int64_t daysSinceEpoch = static_cast<int64_t>(era) * 146097 +
+                                   static_cast<int64_t>(dayOfEra) - 719468;
+    epoch = ((daysSinceEpoch * 24 + hour) * 60 + minute) * 60 + second;
+    return true;
+  }
+
+  static bool parseImport(File& source, File& replacement,
+                          uint32_t& importedCount, uint32_t& highestId)
+  {
+    static uint8_t readerBuffer[BufferedReader::BUFFER_SIZE];
+    static uint8_t writerBuffer[BufferedWriter::BUFFER_SIZE];
+    BufferedReader reader(source, readerBuffer);
+    BufferedWriter writer(replacement, writerBuffer);
+    char key[32]{};
+    char value = 0;
+    bool foundMessages = false;
+    while (readByte(reader, value))
+    {
+      if (value == '"')
+      {
+        reader.seek(reader.position() - 1);
+        if (!readString(reader, key, sizeof(key)))
+        {
+          return false;
+        }
+        if (strcmp(key, "messages") == 0)
+        {
+          foundMessages = true;
+          break;
+        }
+      }
+    }
+    if (!foundMessages || !expect(reader, ':') || !expect(reader, '['))
+    {
+      return false;
+    }
+    char next = 0;
+    if (!nextNonWhitespace(reader, next))
+    {
+      return false;
+    }
+    if (next == ']')
+    {
+      return writer.flush();
+    }
+    reader.seek(reader.position() - 1);
+
+    while (true)
+    {
+      if (!expect(reader, '{') || !expect(reader, '"')) return false;
+      reader.seek(reader.position() - 1);
+      if (!readString(reader, key, sizeof(key)) || strcmp(key, "id") != 0 ||
+        !expect(reader, ':')) return false;
+      uint32_t id = 0;
+      if (!readUnsigned(reader, id) || id == 0 || !expect(reader, ',') ||
+        !expect(reader, '"')) return false;
+      reader.seek(reader.position() - 1);
+      if (!readString(reader, key, sizeof(key)) || strcmp(key, "created_at") != 0 ||
+        !expect(reader, ':')) return false;
+      char timestamp[32]{};
+      if (!readString(reader, timestamp, sizeof(timestamp)) || !expect(reader, ',') ||
+        !expect(reader, '"')) return false;
+      reader.seek(reader.position() - 1);
+      char name[MAX_NAME_LENGTH + 1]{};
+      if (!readString(reader, key, sizeof(key)) || strcmp(key, "name") != 0 ||
+        !expect(reader, ':') || !readString(reader, name, sizeof(name)) ||
+        !expect(reader, ',') || !expect(reader, '"')) return false;
+      reader.seek(reader.position() - 1);
+      char text[MAX_MESSAGE_LENGTH + 1]{};
+      if (!readString(reader, key, sizeof(key)) || strcmp(key, "text") != 0 ||
+        !expect(reader, ':') || !readString(reader, text, sizeof(text)) ||
+        !expect(reader, '}')) return false;
+
+      int64_t epoch = 0;
+      if (!parseTimestamp(timestamp, epoch)) return false;
+      DiskRecord record{};
+      record.magic = RECORD_MAGIC;
+      record.id = id;
+      record.createdAtEpoch = epoch;
+      record.nameLength = static_cast<uint8_t>(strlen(name));
+      record.textLength = static_cast<uint16_t>(strlen(text));
+      if (record.nameLength == 0 || record.textLength == 0)
+      {
+        return false;
+      }
+      memcpy(record.name, name, record.nameLength);
+      memcpy(record.text, text, record.textLength);
+      record.checksum = checksum(record);
+      if (!writer.write(reinterpret_cast<const uint8_t*>(&record), sizeof(record)))
+      {
+        return false;
+      }
+      ++importedCount;
+      highestId = id > highestId ? id : highestId;
+      if ((importedCount & 0x1f) == 0)
+      {
+        esp_task_wdt_reset();
+        delay(0);
+      }
+
+      if (!nextNonWhitespace(reader, next)) return false;
+      if (next == ']') return writer.flush();
+      if (next != ',') return false;
+    }
+  }
+
+  bool rewrite(uint32_t targetId, const char* name, const char* text, bool removeMessage)
+  {
+    if (!ready() || targetId == 0 || (!removeMessage && (name == nullptr || text == nullptr)) ||
+        xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE)
+    {
+      return false;
+    }
+
+    const size_t nameLength = removeMessage ? 0 : strlen(name);
+    const size_t textLength = removeMessage ? 0 : strlen(text);
+    const bool validReplacement = removeMessage ||
+        (nameLength > 0 && nameLength <= MAX_NAME_LENGTH &&
+         textLength > 0 && textLength <= MAX_MESSAGE_LENGTH);
+    if (!validReplacement)
+    {
+      xSemaphoreGive(mutex_);
+      return false;
+    }
+
+    appendFile_.close();
+    File source = FFat.open(FILE_PATH, FILE_READ);
+    File replacement = FFat.open(REPAIR_PATH, FILE_WRITE);
+    StorageHeader header{};
+    bool success = source && replacement && writeHeader(replacement) &&
+      source.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) == sizeof(header) &&
+      isCurrentHeader(header);
+    const size_t sourceSize = source ? source.size() : 0;
+    const size_t dataSize = sourceSize >= sizeof(StorageHeader)
+        ? sourceSize - sizeof(StorageHeader)
+        : 0;
+    const uint32_t expectedRecords = dataSize % sizeof(DiskRecord) == 0
+        ? static_cast<uint32_t>(dataSize / sizeof(DiskRecord))
+        : 0;
+    if (success && (sourceSize < sizeof(StorageHeader) ||
+                    dataSize % sizeof(DiskRecord) != 0))
+    {
+      success = false;
+    }
+    bool found = false;
+    uint32_t recordsRead = 0;
+    static uint8_t rewriteBuffer[BufferedWriter::BUFFER_SIZE];
+    BufferedWriter writer(replacement, rewriteBuffer);
+    DiskRecord record{};
+    while (success && recordsRead < expectedRecords)
+    {
+      if (source.read(reinterpret_cast<uint8_t*>(&record), sizeof(record)) != sizeof(record) ||
+          !isValid(record))
+      {
+        success = false;
+        break;
+      }
+      ++recordsRead;
+      if (record.id == targetId)
+      {
+        found = true;
+        if (!removeMessage)
+        {
+          record.nameLength = static_cast<uint8_t>(nameLength);
+          record.textLength = static_cast<uint16_t>(textLength);
+          memset(record.name, 0, sizeof(record.name));
+          memset(record.text, 0, sizeof(record.text));
+          memcpy(record.name, name, nameLength);
+          memcpy(record.text, text, textLength);
+          record.checksum = checksum(record);
+            success = writer.write(
+              reinterpret_cast<const uint8_t*>(&record), sizeof(record));
+        }
+      }
+      else
+      {
+        success = writer.write(
+          reinterpret_cast<const uint8_t*>(&record), sizeof(record));
+      }
+      if ((recordsRead & 0x1f) == 0)
+      {
+        esp_task_wdt_reset();
+        delay(0);
+      }
+    }
+      if (success && recordsRead != expectedRecords)
+    {
+      success = false;
+    }
+    if (success && !found)
+    {
+      success = false;
+    }
+    if (success)
+    {
+      success = writer.flush();
+      if (success)
+      {
+        replacement.flush();
+      }
+    }
+    if (source)
+    {
+      source.close();
+    }
+    if (replacement)
+    {
+      replacement.close();
+    }
+
+    if (success)
+    {
+      success = installRepairFile();
+      if (success)
+      {
+        messageCount_ = removeMessage ? messageCount_ - 1 : messageCount_;
+        success = rebuildIndex();
+      }
+    }
+    else
+    {
+      FFat.remove(REPAIR_PATH);
+    }
+
+    xSemaphoreGive(mutex_);
+    return success;
+  }
+
+  static bool installRepairFile()
+  {
+    if (!FFat.exists(FILE_PATH))
+    {
+      return FFat.rename(REPAIR_PATH, FILE_PATH);
+    }
+    FFat.remove(BACKUP_PATH);
+    if (!FFat.rename(FILE_PATH, BACKUP_PATH))
+    {
+      FFat.remove(REPAIR_PATH);
+      return false;
+    }
+    if (FFat.rename(REPAIR_PATH, FILE_PATH))
+    {
+      FFat.remove(BACKUP_PATH);
+      return true;
+    }
+    FFat.remove(FILE_PATH);
+    FFat.rename(BACKUP_PATH, FILE_PATH);
+    FFat.remove(REPAIR_PATH);
+    return false;
+  }
+
+  SemaphoreHandle_t mutex_ = nullptr;
+  File importFile_;
+  File appendFile_;
+  IndexEntry* index_ = nullptr;
+  size_t indexCapacity_ = 0;
+  uint32_t nextId_ = 1;
+  uint32_t messageCount_ = 0;
+  bool importInProgress_ = false;
+};
