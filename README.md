@@ -7,7 +7,7 @@ A lightweight message board designed for the **AREDN (Amateur Radio Emergency Da
 
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/DSC_3225.JPG" alt="ESP32" width="500">
 
-<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/msg-board-www.jpg" alt="ESP32" width="500">
+<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/msg-board-www.jpg" alt="ESP32">
 
 
 ## Key Technical Features
@@ -45,20 +45,6 @@ A lightweight message board designed for the **AREDN (Amateur Radio Emergency Da
 * **Hardware:** Arduino Nano ESP32 (or equivalent ESP32 development board with sufficient flash memory mapped for FFat).
 * **Client:** Any standard modern web browser (HTML5/ES6 support required for async/await execution).
 
-## Wi-Fi Setup
-
-The device always starts the `AREDN-Setup` access point, including while connected to the router Wi-Fi:
-
-* **Access point:** `AREDN-Setup`
-* **Password:** `arednsetup`
-* **Setup page:** `http://192.168.4.1/wifi`
-
-Connect a phone or computer to the setup access point and open the setup page.
-
-<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/wifi-setup.png" alt="wifi-setup" width="500">
-
-Scan for nearby networks and select one, or enter its SSID manually to connect to a hidden network; then enter the Wi-Fi password. The ESP32 tests the connection and saves working credentials in its non-volatile storage. If there are no saved credentials, the optional OLED displays the access point name, password, and setup address. The same setup page remains available through the access point for later changes. The Wi-Fi configuration page and API only accept requests from clients connected to that access point.
-
 ## Installation
 
 There are two ways to install the firmware:
@@ -85,6 +71,20 @@ You can also build and install the firmware yourself from the [GitHub source rep
 5. Connect to the `AREDN-Setup` access point and configure the router Wi-Fi as described above.
 
 The service uses the ESP32's built-in `WiFi`, `Wire`, `FFat`, FreeRTOS and system libraries. `WebServer` and `ArduinoJson` are not required.
+
+### Wi-Fi Setup
+
+The device always starts the `AREDN-Setup` access point, including while connected to the router Wi-Fi:
+
+* **Access point:** `AREDN-Setup`
+* **Password:** `arednsetup`
+* **Setup page:** `http://192.168.4.1/wifi`
+
+Connect a phone or computer to the setup access point and open the setup page.
+
+<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/wifi-setup.png" alt="wifi-setup" width="500">
+
+Scan for nearby networks and select one, or enter its SSID manually to connect to a hidden network; then enter the Wi-Fi password. The ESP32 tests the connection and saves working credentials in its non-volatile storage. If there are no saved credentials, the optional OLED displays the access point name, password, and setup address. The same setup page remains available through the access point for later changes. The Wi-Fi configuration page and API only accept requests from clients connected to that access point.
 
 ## Hardware
 
@@ -171,7 +171,7 @@ Use `after=<id>` for newer messages and `before=<id>` for older messages. Additi
 
 ## Security And Deployment
 
-The service uses plain HTTP and is intended for a trusted local AREDN network. It does not provide TLS. The firmware no longer requires `arduino_secrets.h`; local copies of that legacy file should not be included in shared source archives.
+The service uses plain HTTP and is intended for a trusted local AREDN network. It does not provide TLS. The firmware no longer requires `arduino_secrets.h`.
 
 ## Load Test
 
