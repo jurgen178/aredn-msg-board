@@ -80,6 +80,8 @@ The device always starts the `AREDN-Setup` access point, including while connect
 * **Password:** `arednsetup`
 * **Setup page:** `http://192.168.4.1/wifi`
 
+**Important:** The Wi-Fi setup page is only available while your phone or computer is connected to the `AREDN-Setup` access point. It cannot be opened through the router Wi-Fi or the AREDN network.
+
 Connect a phone or computer to the setup access point and open the setup page.
 
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/wifi-setup.png" alt="wifi-setup" width="500">
