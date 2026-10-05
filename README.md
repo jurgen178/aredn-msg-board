@@ -7,10 +7,6 @@ A lightweight message board designed for the **AREDN (Amateur Radio Emergency Da
 
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/DSC_3225.JPG" alt="ESP32" width="500">
 
-https://bitfabrik.io/aredn-msg-board-firmware/
-
-<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/web-flasher.png" alt="web flasher" width="500">
-
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/msg-board-www.jpg" alt="ESP32" width="500">
 
 
@@ -47,10 +43,37 @@ https://bitfabrik.io/aredn-msg-board-firmware/
 ## System Requirements
 
 * **Hardware:** Arduino Nano ESP32 (or equivalent ESP32 development board with sufficient flash memory mapped for FFat).
-* **Software Libraries:** `ESPAsyncWebServer`, `Adafruit GFX Library`, and `Adafruit SSD1306`.
 * **Client:** Any standard modern web browser (HTML5/ES6 support required for async/await execution).
 
+## Wi-Fi Setup
+
+The device always starts the `AREDN-Setup` access point, including while connected to the router Wi-Fi:
+
+* **Access point:** `AREDN-Setup`
+* **Password:** `arednsetup`
+* **Setup page:** `http://192.168.4.1/wifi`
+
+Connect a phone or computer to the setup access point and open the setup page.
+
+<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/wifi-setup.png" alt="wifi-setup" width="500">
+
+Scan for nearby networks and select one, or enter its SSID manually to connect to a hidden network; then enter the Wi-Fi password. The ESP32 tests the connection and saves working credentials in its non-volatile storage. If there are no saved credentials, the optional OLED displays the access point name, password, and setup address. The same setup page remains available through the access point for later changes. The Wi-Fi configuration page and API only accept requests from clients connected to that access point.
+
 ## Installation
+
+There are two ways to install the firmware:
+
+### Flash directly from the web page
+
+The firmware can be flashed directly to the board from the [AREDN Message Board Web Flasher](https://bitfabrik.io/aredn-msg-board-firmware/).
+
+<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/web-flasher.png" alt="web flasher" width="500">
+
+Connect the board to your computer by USB, open the page in a supported browser, and follow its instructions. After flashing, connect to the `AREDN-Setup` access point and configure the router Wi-Fi as described in [Wi-Fi Setup](#wi-fi-setup). Once Wi-Fi is configured, the board is ready to use.
+
+### Build and flash from the GitHub source
+
+You can also build and install the firmware yourself from the [GitHub source repository](https://github.com/jurgen178/aredn-msg-board):
 
 1. Install the ESP32 board package in the Arduino IDE.
 2. Select an Arduino Nano ESP32 or a compatible ESP32 board with FFat support.
@@ -58,20 +81,16 @@ https://bitfabrik.io/aredn-msg-board-firmware/
    * ESPAsyncWebServer
    * Adafruit GFX Library
    * Adafruit SSD1306
-4. Copy the Wi-Fi settings into `arduino_secrets.h`:
-
-```cpp
-#define SECRET_SSID "your-network-name"
-#define SECRET_PASS "your-network-password"
-```
-
-5. Open `aredn-service.ino`, select the correct board and port, then upload the sketch.
+4. Open `aredn-service.ino`, select the correct board and port, then upload the sketch.
+5. Connect to the `AREDN-Setup` access point and configure the router Wi-Fi as described above.
 
 The service uses the ESP32's built-in `WiFi`, `Wire`, `FFat`, FreeRTOS and system libraries. `WebServer` and `ArduinoJson` are not required.
 
 ## Hardware
 
 The optional SSD1306 OLED is connected through the board's default I2C interface. The display address used by the sketch is `0x3C`. The service can also run without the display; it reports the I2C device as unavailable and continues to start the web service.
+
+When no router Wi-Fi credentials have been saved yet, the OLED shows the setup access point name and password and the URL to open on a connected phone or computer.
 
 ### OLED Wiring
 
@@ -115,6 +134,16 @@ The following endpoints require the admin session cookie created by login:
 * `POST /api/admin/message?id=<id>` with form fields `name`, `text`, and `priority`
 * `POST /api/time` with form field `epoch`
 
+### Wi-Fi Setup API
+
+These endpoints are only available to clients connected to the `AREDN-Setup` access point:
+
+* `GET /wifi` serves the Wi-Fi configuration page.
+* `GET /api/wifi/status` returns the connection state and setup/router IP addresses.
+* `POST /api/wifi/scan` starts an asynchronous scan for nearby networks.
+* `GET /api/wifi/networks` returns `scanning`, `complete` with scan results, or `idle`.
+* `POST /api/wifi/config` accepts form fields `ssid` and `password`; credentials are saved after a successful connection.
+
 ### Export
 
 `GET /api/messages/export.json` downloads the complete board as JSON.
@@ -142,7 +171,7 @@ Use `after=<id>` for newer messages and `before=<id>` for older messages. Additi
 
 ## Security And Deployment
 
-The service uses plain HTTP and is intended for a trusted local AREDN network. It does not provide TLS. Keep `arduino_secrets.h` out of shared source archives and change the admin password in the sketch before deployment.
+The service uses plain HTTP and is intended for a trusted local AREDN network. It does not provide TLS. The firmware no longer requires `arduino_secrets.h`; local copies of that legacy file should not be included in shared source archives.
 
 ## Load Test
 

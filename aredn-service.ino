@@ -1,24 +1,27 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <atomic>
+#include <cstring>
 #include <ctime>
 #include <cstdlib>
 #include <sys/time.h>
 #include <esp_system.h>
 #include "BoardPage.h"
 #include "FfatMessageBoard.h"
-#include "arduino_secrets.h"
-
+#include "WifiSetupPage.h"
 
 namespace
 {
 // Time bounds reject uninitialized, implausible, or far-future clock values.
-constexpr char WIFI_SSID[] = SECRET_SSID;
-constexpr char WIFI_PASSWORD[] = SECRET_PASS;
+constexpr char WIFI_AP_SSID[] = "AREDN-Setup";
+constexpr char WIFI_AP_PASSWORD[] = "arednsetup";
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
+constexpr uint32_t WIFI_RECOVERY_DELAY_MS = 5000;
 constexpr int64_t MIN_VALID_EPOCH = 1577836800LL;
 constexpr int64_t CLIENT_TIME_BOOTSTRAP_EPOCH = 1700000000LL;
 constexpr int64_t MAX_VALID_EPOCH = 4102444800LL;
@@ -38,6 +41,7 @@ constexpr uint32_t OLED_PAGE_INTERVAL_MS = 5000;
 
 // These objects are shared by asynchronous HTTP callbacks and the main Arduino loop.
 AsyncWebServer server(80);
+Preferences wifiPreferences;
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
 FfatMessageBoard messageBoard;
 // Atomic fields are read or updated from both the server task and the main loop.
@@ -46,12 +50,31 @@ std::atomic<uint32_t> adminSessionToken{0};
 std::atomic<uint32_t> boardRevision{1};
 std::atomic<uint32_t> fullRefreshRevision{0};
 std::atomic<bool> importUploadActive{false};
+std::atomic<bool> wifiCredentialsSaved{false};
+std::atomic<bool> wifiConfigRequestPending{false};
+std::atomic<uint8_t> wifiProvisionState{0};
+std::atomic<bool> wifiScanActive{false};
 // Client samples are protected because HTTP handlers may run concurrently.
 SemaphoreHandle_t clientTimeMutex = nullptr;
+SemaphoreHandle_t wifiConfigMutex = nullptr;
+SemaphoreHandle_t wifiScanMutex = nullptr;
+char requestedWifiSsid[33]{};
+char requestedWifiPassword[65]{};
+char activeWifiSsid[33]{};
+char activeWifiPassword[65]{};
+String savedWifiSsid;
+String savedWifiPassword;
 int64_t clientTimeSamples[CLIENT_TIME_AGREEMENT_COUNT]{};
 uint32_t clientTimeSampleClients[CLIENT_TIME_AGREEMENT_COUNT]{};
 uint8_t clientTimeSampleCount = 0;
 uint32_t lastReconnectAttempt = 0;
+uint32_t wifiConnectAttemptStart = 0;
+uint32_t wifiRecoveryStart = 0;
+bool wifiConnectAttemptActive = false;
+bool wifiSavingCandidate = false;
+bool wifiCandidateSawDisconnect = false;
+bool wifiRecoveryPending = false;
+bool wifiPreferencesAvailable = false;
 bool wasConnected = false;
 uint32_t lastSerialStatus = 0;
 uint32_t lastDisplayUpdate = 0;
@@ -60,6 +83,20 @@ uint8_t displayedPage = 0;
 bool displayAvailable = false;
 bool latestMessageAvailable = false;
 FfatMessageBoard::Message latestMessage{};
+
+enum WifiProvisionState : uint8_t
+{
+  WIFI_SETUP_REQUIRED,
+  WIFI_CONNECTING,
+  WIFI_CONNECTED,
+  WIFI_FAILED
+};
+
+struct StoredWifiCredentials
+{
+  char ssid[33];
+  char password[65];
+};
 
 struct ImportUploadState
 {
@@ -190,6 +227,20 @@ void drawBoardDisplay()
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
+
+  if (!wifiCredentialsSaved.load(std::memory_order_acquire))
+  {
+    display.println("WiFi setup required");
+    drawDisplayLine(1, "AP: ", WIFI_AP_SSID);
+    drawDisplayLine(2, "Password: ", WIFI_AP_PASSWORD);
+    display.setCursor(0, 32);
+    display.println("Open in browser:");
+    drawDisplayLine(5, "", WiFi.softAPIP().toString().c_str());
+    display.println("/wifi");
+    display.println("Waiting for WiFi");
+    display.display();
+    return;
+  }
 
   if (displayedPage == 0)
   {
@@ -579,6 +630,25 @@ bool isAdminAuthenticated(AsyncWebServerRequest* request)
   return request->getHeader("Cookie")->value().indexOf(expectedCookie) >= 0;
 }
 
+bool isSetupApClient(AsyncWebServerRequest* request)
+{
+  if (request == nullptr || request->client() == nullptr)
+  {
+    return false;
+  }
+
+  const IPAddress apAddress = WiFi.softAPIP();
+  const IPAddress clientAddress = request->client()->remoteIP();
+  return clientAddress[0] == apAddress[0] &&
+         clientAddress[1] == apAddress[1] &&
+         clientAddress[2] == apAddress[2];
+}
+
+void sendSetupApRequired(AsyncWebServerRequest* request)
+{
+  request->send(403, "application/json", "{\"error\":\"setup_ap_required\"}");
+}
+
 void sendAdminRequired(AsyncWebServerRequest* request)
 {
   // Keep authorization failures consistent for every protected route.
@@ -768,6 +838,226 @@ void handleSubmitMessage(AsyncWebServerRequest* request)
 void registerRoutes()
 {
   // Route handlers are asynchronous; long-running storage operations use the board's mutex.
+  server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* request)
+  {
+    if (!isSetupApClient(request))
+    {
+      sendSetupApRequired(request);
+      return;
+    }
+
+    AsyncWebServerResponse* response = request->beginResponse_P(
+        200, "text/html; charset=utf-8", WIFI_SETUP_PAGE);
+    response->addHeader("Cache-Control", "no-cache, must-revalidate");
+    request->send(response);
+  });
+
+  server.on("/api/wifi/status", HTTP_GET, [](AsyncWebServerRequest* request)
+  {
+    if (!isSetupApClient(request))
+    {
+      sendSetupApRequired(request);
+      return;
+    }
+
+    const uint8_t state = wifiProvisionState.load(std::memory_order_acquire);
+    const char* stateName = "setup_required";
+    if (state == WIFI_CONNECTING)
+    {
+      stateName = "connecting";
+    }
+    else if (state == WIFI_CONNECTED)
+    {
+      stateName = "connected";
+    }
+    else if (state == WIFI_FAILED)
+    {
+      stateName = "failed";
+    }
+
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    const String apAddress = WiFi.softAPIP().toString();
+    const String stationAddress = connected ? WiFi.localIP().toString() : "0.0.0.0";
+    char response[192];
+    snprintf(response, sizeof(response),
+             "{\"state\":\"%s\",\"wifi_connected\":%s,"
+             "\"ap_ip\":\"%s\",\"sta_ip\":\"%s\"}",
+             stateName,
+             connected ? "true" : "false",
+             apAddress.c_str(),
+             stationAddress.c_str());
+    request->send(200, "application/json", response);
+  });
+
+  server.on("/api/wifi/scan", HTTP_POST, [](AsyncWebServerRequest* request)
+  {
+    if (!isSetupApClient(request))
+    {
+      sendSetupApRequired(request);
+      return;
+    }
+    if (wifiScanMutex == nullptr ||
+        xSemaphoreTake(wifiScanMutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    {
+      request->send(503, "application/json", "{\"error\":\"wifi_scan_busy\"}");
+      return;
+    }
+
+    if (wifiScanActive.load(std::memory_order_acquire) &&
+        WiFi.scanComplete() == WIFI_SCAN_RUNNING)
+    {
+      xSemaphoreGive(wifiScanMutex);
+      request->send(202, "application/json", "{\"state\":\"scanning\"}");
+      return;
+    }
+
+    WiFi.scanDelete();
+    wifiScanActive.store(false, std::memory_order_release);
+    const int16_t scanResult = WiFi.scanNetworks(true, true, false, 1000);
+    if (scanResult == WIFI_SCAN_FAILED)
+    {
+      Serial.printf("Wi-Fi scan failed to start (result=%d, status=%d)\n",
+                    scanResult, static_cast<int>(WiFi.status()));
+      xSemaphoreGive(wifiScanMutex);
+      request->send(500, "application/json", "{\"error\":\"wifi_scan_failed\"}");
+      return;
+    }
+
+    wifiScanActive.store(true, std::memory_order_release);
+    Serial.printf("Wi-Fi scan started (result=%d; -1 means still running)\n", scanResult);
+    xSemaphoreGive(wifiScanMutex);
+    request->send(202, "application/json", "{\"state\":\"scanning\"}");
+  });
+
+  server.on("/api/wifi/networks", HTTP_GET, [](AsyncWebServerRequest* request)
+  {
+    if (!isSetupApClient(request))
+    {
+      sendSetupApRequired(request);
+      return;
+    }
+    if (wifiScanMutex == nullptr ||
+        xSemaphoreTake(wifiScanMutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    {
+      request->send(503, "application/json", "{\"error\":\"wifi_scan_busy\"}");
+      return;
+    }
+    if (!wifiScanActive.load(std::memory_order_acquire))
+    {
+      xSemaphoreGive(wifiScanMutex);
+      request->send(200, "application/json",
+                    "{\"state\":\"idle\",\"networks\":[]}");
+      return;
+    }
+
+    const int16_t networkCount = WiFi.scanComplete();
+    if (networkCount == WIFI_SCAN_RUNNING)
+    {
+      xSemaphoreGive(wifiScanMutex);
+      request->send(202, "application/json", "{\"state\":\"scanning\"}");
+      return;
+    }
+    if (networkCount == WIFI_SCAN_FAILED)
+    {
+      Serial.printf("Wi-Fi scan failed to complete (status=%d)\n", networkCount);
+      wifiScanActive.store(false, std::memory_order_release);
+      WiFi.scanDelete();
+      xSemaphoreGive(wifiScanMutex);
+      request->send(500, "application/json", "{\"error\":\"wifi_scan_failed\"}");
+      return;
+    }
+
+    AsyncResponseStream* response =
+        request->beginResponseStream("application/json; charset=utf-8");
+    Serial.printf("Wi-Fi scan completed: %d networks found\n", networkCount);
+    response->print("{\"state\":\"complete\",\"networks\":[");
+    bool firstNetwork = true;
+    for (int16_t index = 0; index < networkCount; ++index)
+    {
+      const String ssid = WiFi.SSID(index);
+      if (ssid.isEmpty() || ssid == WIFI_AP_SSID)
+      {
+        continue;
+      }
+      if (!firstNetwork)
+      {
+        response->write(',');
+      }
+      firstNetwork = false;
+      response->print("{\"ssid\":");
+      appendJsonString(*response, ssid.c_str());
+      response->printf(",\"rssi\":%d,\"channel\":%d,\"secure\":%s}",
+                       WiFi.RSSI(index),
+                       WiFi.channel(index),
+                       WiFi.encryptionType(index) == WIFI_AUTH_OPEN ? "false" : "true");
+    }
+    response->print("]}");
+    xSemaphoreGive(wifiScanMutex);
+    request->send(response);
+  });
+
+  server.on("/api/wifi/config", HTTP_POST, [](AsyncWebServerRequest* request)
+  {
+    if (!isSetupApClient(request))
+    {
+      sendSetupApRequired(request);
+      return;
+    }
+    if (!wifiPreferencesAvailable)
+    {
+      request->send(503, "application/json", "{\"error\":\"wifi_storage_unavailable\"}");
+      return;
+    }
+    bool scanRunning = false;
+    if (wifiScanMutex != nullptr)
+    {
+      if (xSemaphoreTake(wifiScanMutex, pdMS_TO_TICKS(100)) != pdTRUE)
+      {
+        request->send(503, "application/json", "{\"error\":\"wifi_scan_busy\"}");
+        return;
+      }
+      scanRunning = wifiScanActive.load(std::memory_order_acquire) &&
+                    WiFi.scanComplete() == WIFI_SCAN_RUNNING;
+      if (wifiScanActive.load(std::memory_order_acquire) && !scanRunning)
+      {
+        WiFi.scanDelete();
+        wifiScanActive.store(false, std::memory_order_release);
+      }
+      xSemaphoreGive(wifiScanMutex);
+    }
+    if (scanRunning)
+    {
+      request->send(409, "application/json", "{\"error\":\"wifi_scan_in_progress\"}");
+      return;
+    }
+    if (!request->hasParam("ssid", true) || !request->hasParam("password", true))
+    {
+      request->send(400, "application/json", "{\"error\":\"missing_credentials\"}");
+      return;
+    }
+
+    const String ssid = request->getParam("ssid", true)->value();
+    const String password = request->getParam("password", true)->value();
+    if (ssid.isEmpty() || ssid.length() > 32 || password.length() > 64)
+    {
+      request->send(400, "application/json", "{\"error\":\"invalid_credentials\"}");
+      return;
+    }
+    if (wifiConfigMutex == nullptr ||
+        xSemaphoreTake(wifiConfigMutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    {
+      request->send(503, "application/json", "{\"error\":\"wifi_config_busy\"}");
+      return;
+    }
+
+    ssid.toCharArray(requestedWifiSsid, sizeof(requestedWifiSsid));
+    password.toCharArray(requestedWifiPassword, sizeof(requestedWifiPassword));
+    xSemaphoreGive(wifiConfigMutex);
+    wifiConfigRequestPending.store(true, std::memory_order_release);
+    wifiProvisionState.store(WIFI_CONNECTING, std::memory_order_release);
+    request->send(202, "application/json", "{\"accepted\":true}");
+  });
+
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request)
   {
     AsyncWebServerResponse* response = request->beginResponse_P(
@@ -1261,51 +1551,189 @@ void setup()
   }
   clientTimeMutex = xSemaphoreCreateMutex();
 
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  Serial.printf("Wi-Fi setup: mode=STA | SSID=\"%s\" | sleep=off | auto-reconnect=on\n",
-                WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setAutoReconnect(false);
+  const IPAddress setupIp(192, 168, 4, 1);
+  const IPAddress setupGateway(192, 168, 4, 1);
+  const IPAddress setupSubnet(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(setupIp, setupGateway, setupSubnet))
+  {
+    Serial.println("ERROR: Could not configure the Wi-Fi setup AP address");
+  }
+  if (!WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD))
+  {
+    Serial.println("ERROR: Could not start the Wi-Fi setup AP");
+  }
+  else
+  {
+    Serial.printf("Wi-Fi setup AP started: SSID=\"%s\" | IP=%s\n",
+                  WIFI_AP_SSID,
+                  WiFi.softAPIP().toString().c_str());
+  }
+  wifiConfigMutex = xSemaphoreCreateMutex();
+  if (wifiConfigMutex == nullptr)
+  {
+    Serial.println("ERROR: Could not create the Wi-Fi configuration mutex");
+  }
+  wifiScanMutex = xSemaphoreCreateMutex();
+  if (wifiScanMutex == nullptr)
+  {
+    Serial.println("ERROR: Could not create the Wi-Fi scan mutex");
+  }
+
+  wifiPreferencesAvailable = wifiPreferences.begin("aredn-wifi", false);
+  if (!wifiPreferencesAvailable)
+  {
+    Serial.println("ERROR: Could not open Wi-Fi credential storage");
+    wifiProvisionState.store(WIFI_SETUP_REQUIRED, std::memory_order_release);
+  }
+  else
+  {
+    StoredWifiCredentials storedCredentials{};
+    const size_t storedSize = wifiPreferences.getBytesLength("credentials");
+    if (storedSize == sizeof(storedCredentials) &&
+        wifiPreferences.getBytes("credentials", &storedCredentials,
+                                 sizeof(storedCredentials)) == sizeof(storedCredentials) &&
+        storedCredentials.ssid[sizeof(storedCredentials.ssid) - 1] == '\0' &&
+        storedCredentials.password[sizeof(storedCredentials.password) - 1] == '\0' &&
+        storedCredentials.ssid[0] != '\0')
+    {
+      savedWifiSsid = storedCredentials.ssid;
+      savedWifiPassword = storedCredentials.password;
+      wifiCredentialsSaved.store(true, std::memory_order_release);
+      wifiProvisionState.store(WIFI_CONNECTING, std::memory_order_release);
+      WiFi.begin(savedWifiSsid.c_str(), savedWifiPassword.c_str());
+      wifiConnectAttemptStart = millis();
+      wifiConnectAttemptActive = true;
+      lastReconnectAttempt = wifiConnectAttemptStart;
+      Serial.printf("Connecting to saved Wi-Fi network \"%s\"\n", savedWifiSsid.c_str());
+    }
+    else
+    {
+      wifiProvisionState.store(WIFI_SETUP_REQUIRED, std::memory_order_release);
+      Serial.println("No saved Wi-Fi credentials; waiting for setup through the access point");
+    }
+  }
+  Serial.printf("Setup page: http://%s/wifi\n", WiFi.softAPIP().toString().c_str());
   Serial.println("Client time synchronization enabled");
   Serial.printf("Wi-Fi connection started (status %d)\n", static_cast<int>(WiFi.status()));
-
-  Serial.println("Waiting for AREDN WLAN connection ...");
-  // Bound startup delay so the HTTP service remains available while Wi-Fi reconnects later.
-  const uint32_t wifiWaitStart = millis();
-  constexpr uint32_t WIFI_STARTUP_TIMEOUT_MS = 30000;
-  // Start the HTTP service even when the mesh network is temporarily unavailable.
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - wifiWaitStart < WIFI_STARTUP_TIMEOUT_MS)
-  {
-    delay(250);
-  }
 
   registerRoutes();
   DefaultHeaders::Instance().addHeader("Connection", "close");
   server.begin();
   Serial.println("Async HTTP server started on port 80");
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.println("Wi-Fi not connected during startup; continuing with reconnect attempts");
-    return;
-  }
-
-  Serial.printf("Wi-Fi connected: SSID=\"%s\" | gateway=%s | subnet=%s | DNS=%s | RSSI=%d dBm\n",
-              WIFI_SSID,
-              WiFi.gatewayIP().toString().c_str(),
-              WiFi.subnetMask().toString().c_str(),
-              WiFi.dnsIP().toString().c_str(),
-              WiFi.RSSI());
-
-  Serial.printf("Web server: http://%s/\n", WiFi.localIP().toString().c_str());
-  wasConnected = true;
 }
 
 void loop()
 {
   const uint32_t now = millis();
-  const bool connected = WiFi.status() == WL_CONNECTED;
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (wifiConfigRequestPending.exchange(false, std::memory_order_acq_rel))
+  {
+    char candidateSsid[sizeof(requestedWifiSsid)]{};
+    char candidatePassword[sizeof(requestedWifiPassword)]{};
+    if (wifiConfigMutex != nullptr &&
+        xSemaphoreTake(wifiConfigMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      memcpy(candidateSsid, requestedWifiSsid, sizeof(candidateSsid));
+      memcpy(candidatePassword, requestedWifiPassword, sizeof(candidatePassword));
+      xSemaphoreGive(wifiConfigMutex);
+
+      memcpy(activeWifiSsid, candidateSsid, sizeof(activeWifiSsid));
+      memcpy(activeWifiPassword, candidatePassword, sizeof(activeWifiPassword));
+      wifiCandidateSawDisconnect = !connected;
+      WiFi.disconnect(false, false);
+      WiFi.begin(activeWifiSsid, activeWifiPassword);
+      wifiConnectAttemptStart = now;
+      wifiConnectAttemptActive = true;
+      wifiSavingCandidate = true;
+      wifiRecoveryPending = false;
+      lastReconnectAttempt = now;
+      wifiProvisionState.store(WIFI_CONNECTING, std::memory_order_release);
+      Serial.printf("Testing Wi-Fi credentials for \"%s\"\n", candidateSsid);
+    }
+    else
+    {
+      wifiProvisionState.store(WIFI_FAILED, std::memory_order_release);
+      Serial.println("ERROR: Could not read the pending Wi-Fi configuration");
+    }
+  }
+  connected = WiFi.status() == WL_CONNECTED;
+  if (wifiSavingCandidate && !connected)
+  {
+    wifiCandidateSawDisconnect = true;
+  }
+  const bool connectedForAttempt =
+      connected && (!wifiSavingCandidate || wifiCandidateSawDisconnect);
+
+  if (connectedForAttempt && wifiConnectAttemptActive)
+  {
+    if (wifiSavingCandidate)
+    {
+      StoredWifiCredentials candidateCredentials{};
+      strncpy(candidateCredentials.ssid, activeWifiSsid,
+              sizeof(candidateCredentials.ssid) - 1);
+      strncpy(candidateCredentials.password, activeWifiPassword,
+              sizeof(candidateCredentials.password) - 1);
+      if (wifiPreferences.putBytes("credentials", &candidateCredentials,
+                                  sizeof(candidateCredentials)) != sizeof(candidateCredentials))
+      {
+        wifiProvisionState.store(WIFI_FAILED, std::memory_order_release);
+        Serial.println("ERROR: Could not save the Wi-Fi credentials");
+        WiFi.disconnect(false, false);
+        wifiSavingCandidate = false;
+        wifiCandidateSawDisconnect = false;
+        wifiConnectAttemptActive = false;
+        wifiRecoveryPending = !savedWifiSsid.isEmpty();
+        wifiRecoveryStart = now;
+      }
+      else
+      {
+        savedWifiSsid = candidateCredentials.ssid;
+        savedWifiPassword = candidateCredentials.password;
+        wifiCredentialsSaved.store(true, std::memory_order_release);
+        wifiProvisionState.store(WIFI_CONNECTED, std::memory_order_release);
+        wifiSavingCandidate = false;
+        wifiCandidateSawDisconnect = false;
+        wifiConnectAttemptActive = false;
+        Serial.printf("Wi-Fi credentials saved; connected to \"%s\"\n",
+                      savedWifiSsid.c_str());
+      }
+    }
+    else
+    {
+      wifiProvisionState.store(WIFI_CONNECTED, std::memory_order_release);
+      wifiConnectAttemptActive = false;
+    }
+  }
+  else if (wifiConnectAttemptActive &&
+           now - wifiConnectAttemptStart >= WIFI_CONNECT_TIMEOUT_MS)
+  {
+    wifiConnectAttemptActive = false;
+    wifiProvisionState.store(WIFI_FAILED, std::memory_order_release);
+    Serial.println("ERROR: Wi-Fi connection attempt timed out; setup AP remains available");
+    if (wifiSavingCandidate)
+    {
+      wifiSavingCandidate = false;
+      wifiCandidateSawDisconnect = false;
+      wifiRecoveryPending = !savedWifiSsid.isEmpty();
+      wifiRecoveryStart = now;
+    }
+    lastReconnectAttempt = now;
+  }
+
+  if (wifiRecoveryPending && now - wifiRecoveryStart >= WIFI_RECOVERY_DELAY_MS)
+  {
+    wifiRecoveryPending = false;
+    WiFi.begin(savedWifiSsid.c_str(), savedWifiPassword.c_str());
+    wifiConnectAttemptStart = now;
+    wifiConnectAttemptActive = true;
+    lastReconnectAttempt = now;
+    wifiProvisionState.store(WIFI_CONNECTING, std::memory_order_release);
+    Serial.printf("Retrying previously saved Wi-Fi network \"%s\"\n", savedWifiSsid.c_str());
+  }
 
   if (displayAvailable)
   {
@@ -1356,14 +1784,18 @@ void loop()
     wasConnected = false;
   }
 
-  // Retry on a timer rather than blocking the loop while the access point is unavailable.
-  if (!connected && now - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS)
+  // Retry saved credentials without interrupting the setup access point.
+  if (!connected && !wifiConnectAttemptActive && !wifiRecoveryPending &&
+      wifiCredentialsSaved.load(std::memory_order_acquire) &&
+      now - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS)
   {
     lastReconnectAttempt = now;
-    Serial.printf("Retrying AREDN WLAN connection (status %d)\n",
+    wifiConnectAttemptStart = now;
+    wifiConnectAttemptActive = true;
+    wifiProvisionState.store(WIFI_CONNECTING, std::memory_order_release);
+    Serial.printf("Retrying saved Wi-Fi connection (status %d)\n",
                   static_cast<int>(WiFi.status()));
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(savedWifiSsid.c_str(), savedWifiPassword.c_str());
   }
 
   delay(10);
