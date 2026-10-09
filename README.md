@@ -7,7 +7,9 @@ A lightweight message board designed for the **AREDN (Amateur Radio Emergency Da
 
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/DSC_3225.JPG" alt="ESP32" width="500">
 
-<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/msg-board-www.jpg" alt="ESP32">
+<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/DSC_3293.JPG" alt="AREDN">
+
+<img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/msg-board-www.jpg" alt="msg board">
 
 
 ## Key Technical Features
@@ -55,7 +57,7 @@ The firmware can be flashed directly to the board from the [AREDN Message Board 
 
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/web-flasher.png" alt="web flasher" width="500">
 
-Connect the board to your computer by USB, open the page in a supported browser, and follow its instructions. After flashing, connect to the `AREDN-Setup` access point and configure the router Wi-Fi as described in [Wi-Fi Setup](#wi-fi-setup). Once Wi-Fi is configured, the board is ready to use.
+Connect the board to your computer by USB, open the page in a supported browser, and follow its instructions. After flashing, connect to the `AREDN-Setup` access point and configure the router Wi-Fi as described in Wi-Fi Setup. Once Wi-Fi is configured, the board is ready to use.
 
 ### Build and flash from the GitHub source
 
@@ -67,7 +69,7 @@ You can also build and install the firmware yourself from the [GitHub source rep
    * ESPAsyncWebServer
    * Adafruit GFX Library
    * Adafruit SSD1306
-4. Open `aredn-service.ino`, select the correct board and port, then upload the sketch.
+4. Open `aredn-msg-board.ino`, select the correct board and port, then upload the sketch.
 5. Connect to the `AREDN-Setup` access point and configure the router Wi-Fi as described above.
 
 The service uses the ESP32's built-in `WiFi`, `Wire`, `FFat`, FreeRTOS and system libraries. `WebServer` and `ArduinoJson` are not required.
