@@ -86,6 +86,10 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
       line-height: 1.35;
     }
 
+    .experimental-note a {
+      color: inherit;
+    }
+
     .network-state {
       display: flex;
       align-items: center;
@@ -564,7 +568,7 @@ static const char BOARD_PAGE[] PROGMEM = R"AREDNHTML(
         <p class="eyebrow">AREDN · Local message service</p>
         <h1>Message Board</h1>
         <p class="intro">Short updates for everyone on the network.</p>
-        <p class="experimental-note">EXPERIMENTAL ESP32-S3 WEB SERVICE · RESOURCE-CONSCIOUS HTTP POLLING</p>
+        <p class="experimental-note">EXPERIMENTAL ESP32-S3 WEB SERVICE · <a href="https://github.com/jurgen178/aredn-msg-board" target="_blank" rel="noopener noreferrer">Project on GitHub</a></p>
       </div>
       <div class="header-indicators">
         <div class="device-clock" aria-label="Device clock">

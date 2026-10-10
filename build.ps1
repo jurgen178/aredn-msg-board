@@ -163,14 +163,19 @@ if (-not $WebPageReady) {
     $StartInfo.WorkingDirectory = $WebFlasherDirectory
     $StartInfo.UseShellExecute = $false
     $StartInfo.CreateNoWindow = $true
-    [void]$StartInfo.ArgumentList.Add($NpmCliPath)
-    [void]$StartInfo.ArgumentList.Add("run")
-    [void]$StartInfo.ArgumentList.Add("dev")
-    [void]$StartInfo.ArgumentList.Add("--")
-    [void]$StartInfo.ArgumentList.Add("--host")
-    [void]$StartInfo.ArgumentList.Add("localhost")
-    [void]$StartInfo.ArgumentList.Add("--port")
-    [void]$StartInfo.ArgumentList.Add([string]$WebFlasherPort)
+    if ($null -ne $StartInfo.ArgumentList) {
+        [void]$StartInfo.ArgumentList.Add($NpmCliPath)
+        [void]$StartInfo.ArgumentList.Add("run")
+        [void]$StartInfo.ArgumentList.Add("dev")
+        [void]$StartInfo.ArgumentList.Add("--")
+        [void]$StartInfo.ArgumentList.Add("--host")
+        [void]$StartInfo.ArgumentList.Add("localhost")
+        [void]$StartInfo.ArgumentList.Add("--port")
+        [void]$StartInfo.ArgumentList.Add([string]$WebFlasherPort)
+    }
+    else {
+        $StartInfo.Arguments = '"{0}" run dev -- --host localhost --port {1}' -f $NpmCliPath, $WebFlasherPort
+    }
     $WebServerProcess = [System.Diagnostics.Process]::Start($StartInfo)
 
     for ($Attempt = 0; $Attempt -lt 40 -and -not $WebPageReady; $Attempt++) {
