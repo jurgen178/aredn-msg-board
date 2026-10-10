@@ -57,7 +57,7 @@ The firmware can be flashed directly to the board from the [AREDN Message Board 
 
 <img src="https://github.com/jurgen178/aredn-msg-board/blob/main/doc/web-flasher.png" alt="web flasher" width="500">
 
-Connect the board to your computer by USB, open the page in a supported browser, and follow its instructions. After flashing, connect to the `AREDN-Setup` access point and configure the router Wi-Fi as described in Wi-Fi Setup. Once Wi-Fi is configured, the board is ready to use.
+Connect the board to your computer by USB, open the page in a supported browser, and follow its instructions. After flashing, connect to the `AREDN-Message-Board-Setup` access point and configure the router Wi-Fi as described in Wi-Fi Setup. Once Wi-Fi is configured, the board is ready to use.
 
 ### Build and flash from the GitHub source
 
@@ -70,19 +70,19 @@ You can also build and install the firmware yourself from the [GitHub source rep
    * Adafruit GFX Library
    * Adafruit SSD1306
 4. Open `aredn-msg-board.ino`, select the correct board and port, then upload the sketch.
-5. Connect to the `AREDN-Setup` access point and configure the router Wi-Fi as described above.
+5. Connect to the `AREDN-Message-Board-Setup` access point and configure the router Wi-Fi as described above.
 
 The service uses the ESP32's built-in `WiFi`, `Wire`, `FFat`, FreeRTOS and system libraries. `WebServer` and `ArduinoJson` are not required.
 
 ### Wi-Fi Setup
 
-The device always starts the `AREDN-Setup` access point, including while connected to the router Wi-Fi:
+The device always starts the `AREDN-Message-Board-Setup` access point, including while connected to the router Wi-Fi:
 
-* **Access point:** `AREDN-Setup`
+* **Access point:** `AREDN-Message-Board-Setup`
 * **Password:** `arednsetup`
 * **Setup page:** `http://192.168.4.1/wifi`
 
-**Important:** The Wi-Fi setup page is only available while your phone or computer is connected to the `AREDN-Setup` access point. It cannot be opened through the router Wi-Fi or the AREDN network.
+**Important:** The Wi-Fi setup page is only available while your phone or computer is connected to the `AREDN-Message-Board-Setup` access point. It cannot be opened through the router Wi-Fi or the AREDN network.
 
 Connect a phone or computer to the setup access point and open the setup page.
 
@@ -140,7 +140,7 @@ The following endpoints require the admin session cookie created by login:
 
 ### Wi-Fi Setup API
 
-These endpoints are only available to clients connected to the `AREDN-Setup` access point:
+These endpoints are only available to clients connected to the `AREDN-Message-Board-Setup` access point:
 
 * `GET /wifi` serves the Wi-Fi configuration page.
 * `GET /api/wifi/status` returns the connection state and setup/router IP addresses.

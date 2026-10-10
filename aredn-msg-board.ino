@@ -17,7 +17,7 @@
 namespace
 {
 // Time bounds reject uninitialized, implausible, or far-future clock values.
-constexpr char WIFI_AP_SSID[] = "AREDN-Setup";
+constexpr char WIFI_AP_SSID[] = "AREDN-Message-Board-Setup";
 constexpr char WIFI_AP_PASSWORD[] = "arednsetup";
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;

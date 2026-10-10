@@ -20,6 +20,11 @@ static const char WIFI_SETUP_PAGE[] PROGMEM = R"AREDNWIFI(
     input, select { box-sizing: border-box; width: 100%; min-height: 46px; padding: 10px; border: 1px solid #aebdb3; border-radius: 5px; font: inherit; }
     button { min-height: 46px; margin-top: 20px; padding: 0 18px; border: 0; border-radius: 5px; color: #fff; background: #173b33; font: inherit; font-weight: 700; }
     button:disabled { opacity: 0.65; }
+    .password-field { position: relative; }
+    .password-field input { padding-right: 52px; }
+    .password-toggle { position: absolute; top: 0; right: 0; width: 46px; min-height: 46px; margin: 0; padding: 0; border: 0; color: #173b33; background: transparent; }
+    .password-toggle:focus-visible { outline: 2px solid #173b33; outline-offset: -2px; }
+    .password-toggle svg { display: block; width: 22px; height: 22px; margin: auto; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
     #status { min-height: 48px; color: #5c6e66; }
     #status.error { color: #a2382d; }
     #scan-status { min-height: 24px; color: #5c6e66; font-size: 0.9rem; }
@@ -41,7 +46,15 @@ static const char WIFI_SETUP_PAGE[] PROGMEM = R"AREDNWIFI(
       <input id="ssid" name="ssid" maxlength="32" autocomplete="off" required>
       <p class="hint">A selected network fills this field. For a hidden network, type its name here.</p>
       <label for="password">Wi-Fi password</label>
-      <input id="password" name="password" type="password" maxlength="64" autocomplete="new-password">
+      <div class="password-field">
+        <input id="password" name="password" type="password" maxlength="64" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button id="password-toggle" class="password-toggle" type="button" aria-label="Show Wi-Fi password" aria-pressed="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"></path>
+            <circle cx="12" cy="12" r="2.5"></circle>
+          </svg>
+        </button>
+      </div>
       <button id="submit" type="submit">Save and connect</button>
     </form>
     <p id="status" role="status" aria-live="polite">Checking device status...</p>
@@ -52,6 +65,8 @@ static const char WIFI_SETUP_PAGE[] PROGMEM = R"AREDNWIFI(
     const scanStatus = document.getElementById('scan-status');
     const networksSelect = document.getElementById('networks');
     const ssidInput = document.getElementById('ssid');
+    const passwordInput = document.getElementById('password');
+    const passwordToggle = document.getElementById('password-toggle');
     let checkingConnection = false;
     let scanningNetworks = false;
 
@@ -59,6 +74,13 @@ static const char WIFI_SETUP_PAGE[] PROGMEM = R"AREDNWIFI(
       statusElement.textContent = message;
       statusElement.classList.toggle('error', isError);
     }
+
+    passwordToggle.addEventListener('click', () => {
+      const isVisible = passwordInput.type === 'text';
+      passwordInput.type = isVisible ? 'password' : 'text';
+      passwordToggle.setAttribute('aria-label', isVisible ? 'Show Wi-Fi password' : 'Hide Wi-Fi password');
+      passwordToggle.setAttribute('aria-pressed', String(!isVisible));
+    });
 
     async function refreshStatus() {
       try {
@@ -196,7 +218,7 @@ static const char WIFI_SETUP_PAGE[] PROGMEM = R"AREDNWIFI(
       if (!selectedSsid) return;
       ssidInput.value = selectedSsid;
       if (selectedOption.dataset.secure === 'false') {
-        document.getElementById('password').value = '';
+        passwordInput.value = '';
       }
     });
     ssidInput.addEventListener('input', () => {
@@ -222,7 +244,7 @@ static const char WIFI_SETUP_PAGE[] PROGMEM = R"AREDNWIFI(
         }
         checkingConnection = true;
         showStatus('Wi-Fi details received. Connecting...');
-        document.getElementById('password').value = '';
+        passwordInput.value = '';
         await refreshStatus();
       } catch (error) {
         checkingConnection = false;
